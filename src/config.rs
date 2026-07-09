@@ -1,7 +1,6 @@
 use crate::{Error, Result};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
 /// Required input sample rate for v0.1.
@@ -102,60 +101,6 @@ impl Language {
             Err(Error::InvalidLanguageHint(hint.to_string()))
         }
     }
-
-    pub(crate) fn as_backend_code(&self) -> Option<String> {
-        match self {
-            Self::Auto => Some("auto".to_string()),
-            Self::Hint(hint) => Some(normalize_language_hint(hint)),
-        }
-    }
-}
-
-fn normalize_language_hint(hint: &str) -> String {
-    match hint.trim() {
-        "ja" => "ja-JP".to_string(),
-        "en" => "en-US".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// ASR backend implementation to load for a transcriber.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum BackendKind {
-    /// Cache-aware Nemotron streaming backend. Emits partial text while speech is active.
-    #[default]
-    Nemotron,
-    /// Parakeet TDT backend. Runs utterance-level inference when VAD finalizes speech.
-    ParakeetTdt,
-}
-
-impl BackendKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Nemotron => "nemotron",
-            Self::ParakeetTdt => "parakeet-tdt",
-        }
-    }
-}
-
-impl FromStr for BackendKind {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "nemotron" | "streaming" => Ok(Self::Nemotron),
-            "parakeet-tdt" | "tdt" | "parakeet_tdt" => Ok(Self::ParakeetTdt),
-            other => Err(Error::InvalidConfig(format!(
-                "unknown ASR backend '{other}'; expected nemotron or parakeet-tdt"
-            ))),
-        }
-    }
-}
-
-impl fmt::Display for BackendKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Preferred execution device. Provider fallback follows the backend's
@@ -217,11 +162,18 @@ impl VadConfig {
     }
 }
 
-/// Configuration for loading and running one streaming transcriber.
+fn normalize_language_hint(hint: &str) -> String {
+    match hint.trim() {
+        "ja" => "ja-JP".to_string(),
+        "en" => "en-US".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Configuration for loading and running one Parakeet TDT transcriber.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriberConfig {
     pub model_dir: PathBuf,
-    pub backend: BackendKind,
     pub device: Device,
     pub language: Language,
     pub vad: VadConfig,
@@ -233,7 +185,6 @@ impl TranscriberConfig {
     pub fn new(model_dir: impl AsRef<Path>) -> Self {
         Self {
             model_dir: model_dir.as_ref().to_path_buf(),
-            backend: BackendKind::default(),
             device: Device::default(),
             language: Language::default(),
             vad: VadConfig::default(),

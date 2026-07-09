@@ -1,4 +1,4 @@
-use crate::backend::{BackendTranscript, StreamingAsrBackend};
+use crate::backend::{AsrBackend, BackendTranscript};
 use crate::event::{TranscriptEvent, TranscriptSegment};
 use crate::vad::{SpeechChunk, VadGate, duration_from_samples};
 use crate::{Error, PcmChunk, Result, TranscriberConfig};
@@ -39,7 +39,7 @@ impl TranscriptionSession {
 
 pub(crate) fn run_transcription_worker(
     config: TranscriberConfig,
-    mut backend: Box<dyn StreamingAsrBackend>,
+    mut backend: Box<dyn AsrBackend>,
     mut vad: Box<dyn VadGate>,
     mut input_rx: mpsc::Receiver<PcmChunk>,
     event_tx: mpsc::Sender<Result<TranscriptEvent>>,
@@ -97,7 +97,7 @@ pub(crate) fn run_transcription_worker(
 
 fn handle_speech_chunks(
     config: &TranscriberConfig,
-    backend: &mut dyn StreamingAsrBackend,
+    backend: &mut dyn AsrBackend,
     event_tx: &mpsc::Sender<Result<TranscriptEvent>>,
     chunks: Vec<SpeechChunk>,
 ) -> bool {

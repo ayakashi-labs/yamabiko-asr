@@ -21,11 +21,10 @@ pub(crate) struct SileroVadGate {
     buffer: Vec<f32>,
     buffer_start_sample: u64,
     next_emit_sample: u64,
-    emit_partials: bool,
 }
 
 impl SileroVadGate {
-    pub(crate) fn new(config: VadConfig, emit_partials: bool) -> Result<Self> {
+    pub(crate) fn new(config: VadConfig) -> Result<Self> {
         config.validate()?;
         let options = SpeechOptions::new()
             .with_sample_rate(SampleRate::Rate16k)
@@ -45,7 +44,6 @@ impl SileroVadGate {
             buffer: Vec::new(),
             buffer_start_sample: 0,
             next_emit_sample: 0,
-            emit_partials,
         })
     }
 
@@ -120,21 +118,6 @@ impl VadGate for SileroVadGate {
                 .segmenter
                 .push_samples(&mut self.session, &mut self.stream, &[])
                 .map_err(|err| Error::Vad(err.to_string()))?;
-        }
-
-        let chunk_end = start_sample.saturating_add(chunk.samples.len() as u64);
-        let emit_start = start_sample.max(self.next_emit_sample);
-        if self.emit_partials && self.segmenter.is_active() && chunk_end > emit_start {
-            let rel_start = (emit_start - start_sample) as usize;
-            let samples = chunk.samples[rel_start..].to_vec();
-            self.next_emit_sample = chunk_end;
-            self.drop_before(chunk_end);
-            out.push(SpeechChunk {
-                samples,
-                start_sample: emit_start,
-                end_sample: chunk_end,
-                is_final: false,
-            });
         }
 
         Ok(out)

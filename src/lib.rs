@@ -1,8 +1,8 @@
-//! Streaming multilingual transcription on top of `parakeet-rs`.
+//! Parakeet-family on-device transcription for desktop applications.
 //!
-//! The crate owns the streaming transcription pipeline, VAD gating, timestamp
-//! accounting, and a small Tokio-based API. Audio capture, resampling, downmix,
-//! and model download stay with the application.
+//! The crate owns the PCM streaming API, VAD gating, timestamp accounting, and
+//! Parakeet TDT inference. Audio capture, resampling, downmix, and model
+//! download stay with the application.
 
 mod backend;
 mod config;
@@ -13,25 +13,25 @@ mod tdt;
 mod vad;
 
 pub use config::{
-    BackendKind, Device, Language, PCM_CHANNELS, PCM_SAMPLE_RATE_HZ, PcmChunk, PcmFormat,
-    TranscriberConfig, VadConfig,
+    Device, Language, PCM_CHANNELS, PCM_SAMPLE_RATE_HZ, PcmChunk, PcmFormat, TranscriberConfig,
+    VadConfig,
 };
 pub use error::{Error, Result};
 pub use event::{TranscriptEvent, TranscriptSegment};
 pub use session::TranscriptionSession;
 
-use backend::{NemotronBackend, ParakeetTdtBackend};
+use backend::ParakeetTdtBackend;
 use session::run_transcription_worker;
 use vad::SileroVadGate;
 
-/// A single streaming transcription engine.
+/// A single Parakeet transcription engine.
 ///
 /// One `Transcriber` owns exactly one ASR backend instance. Future multi-PCM
 /// support should merge or schedule input before it reaches this type; it
 /// should not create hidden extra ASR engines.
 pub struct Transcriber {
     config: TranscriberConfig,
-    backend: Box<dyn backend::StreamingAsrBackend>,
+    backend: Box<dyn backend::AsrBackend>,
     vad: Box<dyn vad::VadGate>,
 }
 
@@ -39,12 +39,8 @@ impl Transcriber {
     /// Load the ASR model and VAD backend from a validated configuration.
     pub fn new(config: TranscriberConfig) -> Result<Self> {
         config.validate()?;
-        let backend: Box<dyn backend::StreamingAsrBackend> = match config.backend {
-            BackendKind::Nemotron => Box::new(NemotronBackend::load(&config)?),
-            BackendKind::ParakeetTdt => Box::new(ParakeetTdtBackend::load(&config)?),
-        };
-        let emit_partials = backend.wants_partial_speech();
-        let vad = Box::new(SileroVadGate::new(config.vad.clone(), emit_partials)?);
+        let backend: Box<dyn backend::AsrBackend> = Box::new(ParakeetTdtBackend::load(&config)?);
+        let vad = Box::new(SileroVadGate::new(config.vad.clone())?);
         Ok(Self {
             config,
             backend,
@@ -52,7 +48,7 @@ impl Transcriber {
         })
     }
 
-    /// Start the Tokio-facing streaming API.
+    /// Start the Tokio-facing streaming input/output API.
     ///
     /// The worker runs on Tokio's blocking pool because ONNX inference is
     /// synchronous. Input and output are bounded channels to provide natural
@@ -74,7 +70,7 @@ impl Transcriber {
     #[cfg(test)]
     fn from_parts(
         config: TranscriberConfig,
-        backend: Box<dyn backend::StreamingAsrBackend>,
+        backend: Box<dyn backend::AsrBackend>,
         vad: Box<dyn vad::VadGate>,
     ) -> Result<Self> {
         config.validate()?;
@@ -97,11 +93,7 @@ mod tests {
         next: usize,
     }
 
-    impl backend::StreamingAsrBackend for FakeBackend {
-        fn wants_partial_speech(&self) -> bool {
-            true
-        }
-
+    impl backend::AsrBackend for FakeBackend {
         fn accept_speech(
             &mut self,
             speech: &vad::SpeechChunk,
@@ -223,26 +215,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_emits_partial_final_and_end_events() {
+    async fn stream_emits_final_and_end_events() {
         let backend = FakeBackend {
             calls: Arc::new(Mutex::new(Vec::new())),
             next: 0,
         };
         let vad = FakeVad {
-            chunks: vec![vec![
-                vad::SpeechChunk {
-                    samples: vec![0.1; 4],
-                    start_sample: 0,
-                    end_sample: 4,
-                    is_final: false,
-                },
-                vad::SpeechChunk {
-                    samples: vec![0.1; 4],
-                    start_sample: 4,
-                    end_sample: 8,
-                    is_final: true,
-                },
-            ]],
+            chunks: vec![vec![vad::SpeechChunk {
+                samples: vec![0.1; 8],
+                start_sample: 0,
+                end_sample: 8,
+                is_final: true,
+            }]],
         };
         let transcriber =
             Transcriber::from_parts(test_config(), Box::new(backend), Box::new(vad)).unwrap();
@@ -257,20 +241,12 @@ mod tests {
 
         let first = session.events.recv().await.unwrap().unwrap();
         let second = session.events.recv().await.unwrap().unwrap();
-        let third = session.events.recv().await.unwrap().unwrap();
 
         assert!(matches!(
             first,
-            TranscriptEvent::Segment(TranscriptSegment {
-                is_final: false,
-                ..
-            })
-        ));
-        assert!(matches!(
-            second,
             TranscriptEvent::Segment(TranscriptSegment { is_final: true, .. })
         ));
-        assert!(matches!(third, TranscriptEvent::EndOfStream));
+        assert!(matches!(second, TranscriptEvent::EndOfStream));
     }
 
     #[test]
@@ -299,18 +275,5 @@ mod tests {
             config.validate(),
             Err(Error::InvalidLanguageHint(_))
         ));
-    }
-
-    #[test]
-    fn backend_kind_parses_supported_names() {
-        assert_eq!(
-            "nemotron".parse::<BackendKind>().unwrap(),
-            BackendKind::Nemotron
-        );
-        assert_eq!(
-            "tdt".parse::<BackendKind>().unwrap(),
-            BackendKind::ParakeetTdt
-        );
-        assert!("unknown".parse::<BackendKind>().is_err());
     }
 }

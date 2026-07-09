@@ -4,7 +4,7 @@ use std::fmt;
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Errors exposed to applications using the streaming transcription pipeline.
+/// Errors exposed to applications using the Parakeet transcription pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     /// Input PCM did not match the required v0.1 format.
@@ -12,7 +12,7 @@ pub enum Error {
         expected: PcmFormat,
         actual: PcmFormat,
     },
-    /// A language hint was empty or not accepted by the selected backend.
+    /// A language hint was empty or not accepted by the Parakeet backend.
     InvalidLanguageHint(String),
     /// A configuration value was outside the supported range.
     InvalidConfig(String),

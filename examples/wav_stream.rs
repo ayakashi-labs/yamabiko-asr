@@ -1,4 +1,4 @@
-use asr_crate::{BackendKind, Language, PcmChunk, Transcriber, TranscriberConfig, TranscriptEvent};
+use asr_crate::{Language, PcmChunk, Transcriber, TranscriberConfig, TranscriptEvent};
 use std::error::Error;
 use std::time::Duration;
 
@@ -7,7 +7,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = parse_args()?;
 
     let mut config = TranscriberConfig::new(&args.model_dir);
-    config.backend = args.backend;
     apply_vad_args(&mut config, &args);
     if let Some(language) = args.language {
         config.language = Language::hint(language)?;
@@ -47,7 +46,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 struct ExampleArgs {
     model_dir: String,
     wav_path: String,
-    backend: BackendKind,
     language: Option<String>,
     vad_threshold: Option<f32>,
     vad_min_speech_ms: Option<u64>,
@@ -56,7 +54,6 @@ struct ExampleArgs {
 }
 
 fn parse_args() -> Result<ExampleArgs, Box<dyn Error + Send + Sync>> {
-    let mut backend = BackendKind::default();
     let mut vad_threshold = None;
     let mut vad_min_speech_ms = None;
     let mut vad_min_silence_ms = None;
@@ -65,12 +62,7 @@ fn parse_args() -> Result<ExampleArgs, Box<dyn Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
-        if arg == "--backend" {
-            let value = args.next().ok_or("missing value for --backend")?;
-            backend = value.parse()?;
-        } else if let Some(value) = arg.strip_prefix("--backend=") {
-            backend = value.parse()?;
-        } else if arg == "--vad-threshold" {
+        if arg == "--vad-threshold" {
             vad_threshold = Some(parse_f32_arg(&arg, args.next())?);
         } else if let Some(value) = arg.strip_prefix("--vad-threshold=") {
             vad_threshold = Some(value.parse()?);
@@ -93,7 +85,7 @@ fn parse_args() -> Result<ExampleArgs, Box<dyn Error + Send + Sync>> {
 
     if positional.len() < 2 || positional.len() > 3 {
         return Err(
-            "usage: wav_stream [--backend nemotron|parakeet-tdt] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> <16k-mono-wav> [language]"
+            "usage: wav_stream [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> <16k-mono-wav> [language]"
                 .into(),
         );
     }
@@ -101,7 +93,6 @@ fn parse_args() -> Result<ExampleArgs, Box<dyn Error + Send + Sync>> {
     Ok(ExampleArgs {
         model_dir: positional.remove(0),
         wav_path: positional.remove(0),
-        backend,
         language: positional.pop(),
         vad_threshold,
         vad_min_speech_ms,

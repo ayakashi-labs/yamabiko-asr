@@ -1,10 +1,8 @@
 use crate::tdt::JapaneseTdtModel;
 use crate::vad::SpeechChunk;
-use crate::{Device, Error, Language, Result, TranscriberConfig};
-use parakeet_rs::{ExecutionConfig, ExecutionProvider, Nemotron, NemotronMode};
+use crate::{Error, Language, Result, TranscriberConfig};
 
-pub(crate) trait StreamingAsrBackend: Send {
-    fn wants_partial_speech(&self) -> bool;
+pub(crate) trait AsrBackend: Send {
     fn accept_speech(
         &mut self,
         speech: &SpeechChunk,
@@ -19,83 +17,6 @@ pub(crate) struct BackendTranscript {
     pub start_sample: u64,
     pub end_sample: u64,
     pub is_final: bool,
-}
-
-pub(crate) struct NemotronBackend {
-    model: Nemotron,
-    last_segment: Option<BackendTranscript>,
-}
-
-impl NemotronBackend {
-    pub(crate) fn load(config: &TranscriberConfig) -> Result<Self> {
-        let exec_config = execution_config(config.device)?;
-        let mut model = Nemotron::from_pretrained(&config.model_dir, Some(exec_config))
-            .map_err(|err| Error::ModelLoad(err.to_string()))?;
-
-        if model.mode() == NemotronMode::Multilingual {
-            if let Some(language) = config.language.as_backend_code() {
-                model
-                    .set_target_lang(&language)
-                    .map_err(|err| Error::InvalidLanguageHint(err.to_string()))?;
-            }
-        } else if !matches!(config.language, Language::Auto) {
-            return Err(Error::InvalidLanguageHint(
-                "language hints require a multilingual Nemotron model".to_string(),
-            ));
-        }
-
-        Ok(Self {
-            model,
-            last_segment: None,
-        })
-    }
-}
-
-impl StreamingAsrBackend for NemotronBackend {
-    fn wants_partial_speech(&self) -> bool {
-        true
-    }
-
-    fn accept_speech(
-        &mut self,
-        speech: &SpeechChunk,
-        _language: &Language,
-    ) -> Result<Vec<BackendTranscript>> {
-        if speech.samples.is_empty() {
-            if speech.is_final
-                && let Some(mut segment) = self.last_segment.take()
-            {
-                segment.end_sample = segment.end_sample.max(speech.end_sample);
-                segment.is_final = true;
-                return Ok(vec![segment]);
-            }
-            return Ok(Vec::new());
-        }
-
-        let text = self
-            .model
-            .transcribe_chunk(&speech.samples)
-            .map_err(|err| Error::Backend(err.to_string()))?;
-
-        let transcript = BackendTranscript {
-            text,
-            start_sample: speech.start_sample,
-            end_sample: speech.end_sample,
-            is_final: speech.is_final,
-        };
-
-        if transcript.is_final {
-            self.last_segment = None;
-        } else if !transcript.text.trim().is_empty() {
-            self.last_segment = Some(transcript.clone());
-        }
-
-        Ok(vec![transcript])
-    }
-
-    fn flush(&mut self, _next_input_sample: u64) -> Result<Vec<BackendTranscript>> {
-        Ok(Vec::new())
-    }
 }
 
 pub(crate) struct ParakeetTdtBackend {
@@ -162,11 +83,7 @@ impl ParakeetTdtBackend {
     }
 }
 
-impl StreamingAsrBackend for ParakeetTdtBackend {
-    fn wants_partial_speech(&self) -> bool {
-        false
-    }
-
+impl AsrBackend for ParakeetTdtBackend {
     fn accept_speech(
         &mut self,
         speech: &SpeechChunk,
@@ -185,15 +102,6 @@ impl StreamingAsrBackend for ParakeetTdtBackend {
     }
 }
 
-fn execution_config(device: Device) -> Result<ExecutionConfig> {
-    let provider = match device {
-        Device::Cpu => ExecutionProvider::Cpu,
-        Device::DirectMl => ExecutionProvider::DirectML,
-    };
-
-    Ok(ExecutionConfig::new().with_execution_provider(provider))
-}
-
 fn validate_tdt_language(language: &Language) -> Result<()> {
     match language {
         Language::Auto => Ok(()),
@@ -205,5 +113,23 @@ fn validate_tdt_language(language: &Language) -> Result<()> {
         Language::Hint(hint) => Err(Error::InvalidLanguageHint(format!(
             "ParakeetTDT backend currently accepts auto or ja/ja-JP for the Japanese model, got {hint}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tdt_language_validation_accepts_japanese_or_auto() {
+        assert!(validate_tdt_language(&Language::Auto).is_ok());
+        assert!(validate_tdt_language(&Language::Hint("ja".to_string())).is_ok());
+        assert!(validate_tdt_language(&Language::Hint("ja-JP".to_string())).is_ok());
+    }
+
+    #[test]
+    fn tdt_language_validation_rejects_non_japanese_hints() {
+        let err = validate_tdt_language(&Language::Hint("en-US".to_string())).unwrap_err();
+        assert!(matches!(err, Error::InvalidLanguageHint(_)));
     }
 }

@@ -1,18 +1,16 @@
 # asr-crate
 
-Multilingual streaming transcription crate for desktop apps. The current
+Parakeet-family on-device transcription crate for desktop apps. The current
 implementation targets f32 mono 16 kHz PCM, runs Silero VAD before ASR, and
-uses `parakeet-rs` Nemotron streaming models for on-device transcription.
-It can also run Parakeet TDT models as a final-only utterance backend.
+uses a local ONNX runner for Parakeet TDT models.
 
 ## Current Scope
 
-- Tokio-based streaming API.
+- Tokio-based streaming input/output API.
 - Input timestamps are preserved even when VAD removes silent audio before ASR.
-- Output events contain partial/final transcript segments.
+- Output events currently contain VAD-final utterance segments.
 - CPU and DirectML execution can be selected explicitly.
-- Backends: `nemotron` for true streaming, `parakeet-tdt` for VAD-final
-  Japanese utterance recognition with 80 mel TDT models.
+- Current model path: `nvidia/parakeet-tdt_ctc-0.6b-ja` exported to ONNX.
 - Audio capture, resampling, downmixing, and model download are application
   responsibilities.
 
@@ -22,7 +20,7 @@ It can also run Parakeet TDT models as a final-only utterance backend.
 use asr_crate::{PcmChunk, TranscriptEvent, Transcriber, TranscriberConfig};
 
 # async fn run() -> asr_crate::Result<()> {
-let config = TranscriberConfig::new("path/to/nemotron-model");
+let config = TranscriberConfig::new("path/to/parakeet-tdt-model");
 let transcriber = Transcriber::new(config)?;
 let (input, mut events) = transcriber.start().into_channels();
 
@@ -38,16 +36,14 @@ while let Some(event) = events.recv().await {
 # }
 ```
 
-For the Japanese Parakeet TDT model, export ONNX files first and select the
-backend in examples:
+For the Japanese Parakeet TDT model, export ONNX files first:
 
 ```powershell
 python tools/export_parakeet_tdt_ja.py
-cargo run --example microphone -- --backend parakeet-tdt --vad-min-silence-ms 800 .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --example microphone -- --vad-min-silence-ms 800 .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 ```
 
-The `parakeet-tdt` backend uses a small local ONNX runner because the current
-`parakeet-rs::ParakeetTDT` helper assumes 128 mel features, while
-`nvidia/parakeet-tdt_ctc-0.6b-ja` expects 80.
+The local ONNX runner is used because `nvidia/parakeet-tdt_ctc-0.6b-ja`
+expects 80 mel features.
 
 See `docs/requirements.md` for the current requirements and future scope.
