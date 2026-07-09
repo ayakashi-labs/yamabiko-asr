@@ -47,11 +47,14 @@ features. Users provide the PCM input pipeline and compatible local model files.
 - Speaker diarization should be added as an optional feature using Sortformer.
 - Multi-PCM support should merge inputs before the single ASR engine.
 - Parakeet multilingual models such as `nvidia/parakeet-tdt-0.6b-v3` should be
-  investigated after the model export and runner requirements are verified.
+  supported through a separate export script. Runtime behavior and language
+  validation should be verified per model before documenting production use.
 - True streaming partial output can be added when a Parakeet backend supports
   it reliably in this crate.
 - Translation can be added after transcription semantics are stable.
-- The public crate name and license must be decided before publication.
+- The initial public crate name is `asr-crate`.
+- The crate license is `MIT OR Apache-2.0`. Model files are not distributed by
+  this crate and remain governed by their upstream licenses.
 
 ## Quality Requirements
 

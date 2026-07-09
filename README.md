@@ -4,6 +4,19 @@ Parakeet-family on-device transcription crate for desktop apps. The current
 implementation targets f32 mono 16 kHz PCM, runs Silero VAD before ASR, and
 uses a local ONNX runner for Parakeet TDT models.
 
+## Installation
+
+```toml
+[dependencies]
+asr-crate = "0.1"
+```
+
+Enable optional features when needed:
+
+```toml
+asr-crate = { version = "0.1", features = ["serde", "directml"] }
+```
+
 ## Current Scope
 
 - Tokio-based streaming input/output API.
@@ -12,7 +25,9 @@ uses a local ONNX runner for Parakeet TDT models.
 - ASR execution device can be selected explicitly: `cpu`, `auto`,
   `directml`, `cuda`, `tensorrt`, `openvino`, `rocm`, `coreml`, `xnnpack`,
   or `onednn`.
-- Current model path: `nvidia/parakeet-tdt_ctc-0.6b-ja` exported to ONNX.
+- Current model paths: `nvidia/parakeet-tdt_ctc-0.6b-ja` for Japanese and
+  `nvidia/parakeet-tdt-0.6b-v3` for supported European languages, exported to
+  ONNX.
 - Audio capture, resampling, downmixing, and model download are application
   responsibilities.
 
@@ -55,6 +70,13 @@ python tools/export_parakeet_tdt_ja.py
 cargo run --example microphone -- --vad-min-silence-ms 800 .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 ```
 
+For the multilingual Parakeet TDT v3 model:
+
+```powershell
+python tools/export_parakeet_tdt_multilingual.py
+cargo run --example microphone -- --vad-min-silence-ms 800 .\models\parakeet-tdt-0.6b-v3-onnx
+```
+
 The local ONNX runner is used because `nvidia/parakeet-tdt_ctc-0.6b-ja`
 expects 80 mel features.
 
@@ -68,3 +90,8 @@ cargo run --features openvino --example microphone -- --device openvino .\models
 ```
 
 See `docs/requirements.md` for the current requirements and future scope.
+
+## License
+
+This crate is licensed under either MIT or Apache-2.0, at your option. Model
+files are not distributed by this crate; check each model's license before use.
