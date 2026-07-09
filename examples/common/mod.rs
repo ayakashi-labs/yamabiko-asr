@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use asr_crate::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
+use yamabiko_asr::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
 use std::error::Error;
 use std::time::Duration;
 

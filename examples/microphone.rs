@@ -1,6 +1,6 @@
 mod common;
 
-use asr_crate::{PcmChunk, Transcriber};
+use yamabiko_asr::{PcmChunk, Transcriber};
 use common::audio::{ASR_CHUNK_SAMPLES, MicResampler, TARGET_SAMPLE_RATE, downmix_to_mono, rms};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::time::Instant;

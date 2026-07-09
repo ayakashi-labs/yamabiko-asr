@@ -52,7 +52,7 @@ features. Users provide the PCM input pipeline and compatible local model files.
 - True streaming partial output can be added when a Parakeet backend supports
   it reliably in this crate.
 - Translation can be added after transcription semantics are stable.
-- The initial public crate name is `asr-crate`.
+- The initial public crate name is `yamabiko-asr`.
 - The crate license is `MIT OR Apache-2.0`. Model files are not distributed by
   this crate and remain governed by their upstream licenses.
 

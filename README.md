@@ -1,4 +1,4 @@
-# asr-crate
+# yamabiko-asr
 
 Parakeet-family on-device transcription crate for desktop apps. The current
 implementation targets f32 mono 16 kHz PCM, runs Silero VAD before ASR, and
@@ -8,13 +8,13 @@ uses a local ONNX runner for Parakeet TDT models.
 
 ```toml
 [dependencies]
-asr-crate = "0.1"
+yamabiko-asr = "0.1"
 ```
 
 Enable optional features when needed:
 
 ```toml
-asr-crate = { version = "0.1", features = ["serde", "directml"] }
+yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
 ```
 
 ## Current Scope
@@ -34,9 +34,9 @@ asr-crate = { version = "0.1", features = ["serde", "directml"] }
 ## Minimal Shape
 
 ```rust,no_run
-use asr_crate::{PcmChunk, TranscriptEvent, Transcriber};
+use yamabiko_asr::{PcmChunk, TranscriptEvent, Transcriber};
 
-# async fn run() -> asr_crate::Result<()> {
+# async fn run() -> yamabiko_asr::Result<()> {
 let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
 let (input, mut events) = transcriber.start().into_channels();
 
@@ -56,8 +56,8 @@ For Tauri-style UI events, enable the optional `serde` feature and emit the
 millisecond payload:
 
 ```rust,no_run
-# use asr_crate::{TranscriptEvent, TranscriptSegmentPayload};
-# fn emit_to_ui(segment: &asr_crate::TranscriptSegment) {
+# use yamabiko_asr::{TranscriptEvent, TranscriptSegmentPayload};
+# fn emit_to_ui(segment: &yamabiko_asr::TranscriptSegment) {
 let payload: TranscriptSegmentPayload = segment.to_payload();
 // app.emit("transcript-segment", payload)?;
 # }
