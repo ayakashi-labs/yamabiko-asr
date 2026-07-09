@@ -24,12 +24,16 @@ yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
 - Output events currently contain VAD-final utterance segments.
 - ASR execution device can be selected explicitly: `cpu`, `auto`,
   `directml`, `cuda`, `tensorrt`, `openvino`, `rocm`, `coreml`, `xnnpack`,
-  or `onednn`.
-- Current model paths: `nvidia/parakeet-tdt_ctc-0.6b-ja` for Japanese and
-  `nvidia/parakeet-tdt-0.6b-v3` for supported European languages, exported to
-  ONNX.
+  or `onednn`. The default build and default device use CPU. `auto` may try
+  enabled accelerators before CPU; explicit accelerator selections require the
+  matching Cargo feature and runtime libraries.
+- Current verified model path: `nvidia/parakeet-tdt_ctc-0.6b-ja` for Japanese,
+  exported to ONNX.
+- `nvidia/parakeet-tdt-0.6b-v3` can be exported for experimental multilingual
+  testing. In v0.1, run it with automatic language selection; explicit
+  non-Japanese language hints are not accepted yet.
 - Audio capture, resampling, downmixing, and model download are application
-  responsibilities.
+  responsibilities. Examples include small helpers for local testing.
 
 ## Minimal Shape
 
@@ -70,7 +74,8 @@ python tools/export_parakeet_tdt_ja.py
 cargo run --example microphone -- --vad-min-silence-ms 800 .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 ```
 
-For the multilingual Parakeet TDT v3 model:
+For experimental multilingual Parakeet TDT v3 testing, omit the language
+argument and use automatic language selection:
 
 ```powershell
 python tools/export_parakeet_tdt_multilingual.py
@@ -88,8 +93,6 @@ cargo run --features directml --example microphone -- --device directml .\models
 cargo run --features cuda --example microphone -- --device cuda .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 cargo run --features openvino --example microphone -- --device openvino .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 ```
-
-See `docs/requirements.md` for the current requirements and future scope.
 
 ## License
 
