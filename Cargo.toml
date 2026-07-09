@@ -5,3 +5,14 @@ edition = "2024"
 publish = false
 
 [dependencies]
+ndarray = "0.17.2"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24", "directml"] }
+parakeet-rs = { version = "0.3.6", features = ["directml"] }
+realfft = "3.5.0"
+silero = { version = "0.4.0", features = ["directml"] }
+tokio = { version = "1.52.3", features = ["rt", "macros", "sync"] }
+
+[dev-dependencies]
+cpal = "0.18.1"
+hound = "3.5.1"
+rubato = "3.0.0"
