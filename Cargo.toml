@@ -2,7 +2,22 @@
 name = "asr-crate"
 version = "0.1.0"
 edition = "2024"
-publish = false
+description = "On-device Parakeet-family speech transcription for desktop Rust apps."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ayakashi-labs/asr-crate"
+readme = "README.md"
+keywords = ["asr", "speech", "parakeet", "transcription", "tauri"]
+categories = ["multimedia::audio"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-*",
+    "/docs/**",
+    "/examples/**",
+    "/src/**",
+    "/tools/**",
+]
 
 [features]
 default = []
