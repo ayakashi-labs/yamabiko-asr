@@ -2,6 +2,7 @@ use crate::{Device, Error, PCM_SAMPLE_RATE_HZ, Result};
 use ndarray::{Array1, Array2, Array3};
 use ort::ep::ExecutionProviderDispatch;
 use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::value::ValueType;
 use realfft::RealToComplex;
 use std::f32::consts::PI;
 use std::fs::File;
@@ -9,21 +10,28 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const FEATURE_SIZE: usize = 80;
 const N_FFT: usize = 512;
 const HOP_LENGTH: usize = 160;
 const WIN_LENGTH: usize = 400;
 const PREEMPHASIS: f32 = 0.97;
+const SENTENCEPIECE_SPACE: char = '\u{2581}';
 
-pub(crate) struct JapaneseTdtModel {
+pub(crate) struct ParakeetTdtModel {
     encoder: Session,
     decoder_joint: Session,
     vocab: Vec<String>,
     mel_basis: Array2<f32>,
     fft_plan: Arc<dyn RealToComplex<f32>>,
+    word_boundary: WordBoundary,
 }
 
-impl JapaneseTdtModel {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordBoundary {
+    Strip,
+    Space,
+}
+
+impl ParakeetTdtModel {
     pub(crate) fn load(model_dir: &Path, device: Device) -> Result<Self> {
         if !model_dir.is_dir() {
             return Err(Error::ModelLoad(format!(
@@ -34,8 +42,10 @@ impl JapaneseTdtModel {
 
         let encoder = build_session(&find_encoder(model_dir)?, device)?;
         let decoder_joint = build_session(&find_decoder_joint(model_dir)?, device)?;
+        let feature_size = encoder_feature_size(&encoder)?;
         let vocab = load_vocab(&model_dir.join("vocab.txt"))?;
-        let mel_basis = create_mel_filterbank(N_FFT, FEATURE_SIZE, PCM_SAMPLE_RATE_HZ as usize);
+        let word_boundary = word_boundary_for_vocab(&vocab);
+        let mel_basis = create_mel_filterbank(N_FFT, feature_size, PCM_SAMPLE_RATE_HZ as usize);
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_plan = planner.plan_fft_forward(N_FFT);
 
@@ -45,6 +55,7 @@ impl JapaneseTdtModel {
             vocab,
             mel_basis,
             fft_plan,
+            word_boundary,
         })
     }
 
@@ -224,9 +235,21 @@ impl JapaneseTdtModel {
             if token_text.starts_with('<') && token_text.ends_with('>') && token_text != "<unk>" {
                 continue;
             }
-            text.push_str(&token_text.replace('▁', ""));
+            let replacement = match self.word_boundary {
+                WordBoundary::Strip => "",
+                WordBoundary::Space => " ",
+            };
+            text.push_str(&token_text.replace(SENTENCEPIECE_SPACE, replacement));
         }
         text.trim().to_string()
+    }
+}
+
+fn word_boundary_for_vocab(vocab: &[String]) -> WordBoundary {
+    if vocab.iter().any(|token| token == "<|en|>") {
+        WordBoundary::Space
+    } else {
+        WordBoundary::Strip
     }
 }
 
@@ -303,6 +326,38 @@ fn execution_providers_for(device: Device) -> Vec<ExecutionProviderDispatch> {
 
 fn cpu_provider() -> ExecutionProviderDispatch {
     ort::ep::CPU::default().build().error_on_failure()
+}
+
+fn encoder_feature_size(encoder: &Session) -> Result<usize> {
+    let Some(input) = encoder
+        .inputs()
+        .iter()
+        .find(|input| input.name() == "audio_signal")
+    else {
+        return Err(Error::ModelLoad(
+            "encoder model is missing audio_signal input".to_string(),
+        ));
+    };
+
+    let ValueType::Tensor { shape, .. } = input.dtype() else {
+        return Err(Error::ModelLoad(format!(
+            "encoder audio_signal input must be a tensor, got {:?}",
+            input.dtype()
+        )));
+    };
+
+    let Some(&feature_size) = shape.get(1) else {
+        return Err(Error::ModelLoad(format!(
+            "encoder audio_signal input must be rank 3, got shape {shape:?}"
+        )));
+    };
+    if feature_size <= 0 {
+        return Err(Error::ModelLoad(format!(
+            "encoder audio_signal feature dimension must be static, got shape {shape:?}"
+        )));
+    }
+
+    Ok(feature_size as usize)
 }
 
 fn extract_state(value: &ort::value::Value, name: &str) -> Result<Array3<f32>> {
@@ -505,6 +560,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn word_boundary_uses_spaces_for_multilingual_vocab() {
+        let vocab = vec!["<unk>".to_string(), "<|en|>".to_string()];
+        assert_eq!(word_boundary_for_vocab(&vocab), WordBoundary::Space);
+    }
+
+    #[test]
+    fn word_boundary_strips_spaces_for_legacy_vocab() {
+        let vocab = vec!["<unk>".to_string(), "token".to_string()];
+        assert_eq!(word_boundary_for_vocab(&vocab), WordBoundary::Strip);
+    }
+
+    #[test]
     #[ignore = "requires the local converted Japanese TDT model"]
     fn converted_ja_model_runs_one_second_of_audio() {
         let model_dir = Path::new("models/parakeet-tdt_ctc-0.6b-ja-onnx");
@@ -514,7 +581,7 @@ mod tests {
             model_dir.display()
         );
 
-        let mut model = JapaneseTdtModel::load(model_dir, Device::Cpu).unwrap();
+        let mut model = ParakeetTdtModel::load(model_dir, Device::Cpu).unwrap();
         let text = model.transcribe_samples(vec![0.0; PCM_SAMPLE_RATE_HZ as usize]);
         assert!(text.is_ok());
     }

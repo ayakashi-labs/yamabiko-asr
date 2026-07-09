@@ -1,4 +1,4 @@
-use crate::tdt::JapaneseTdtModel;
+use crate::tdt::ParakeetTdtModel;
 use crate::vad::SpeechChunk;
 use crate::{Error, Language, Result, TranscriberConfig};
 
@@ -20,7 +20,7 @@ pub(crate) struct BackendTranscript {
 }
 
 pub(crate) struct ParakeetTdtBackend {
-    model: JapaneseTdtModel,
+    model: ParakeetTdtModel,
     pending_samples: Vec<f32>,
     pending_start_sample: Option<u64>,
     pending_end_sample: u64,
@@ -29,7 +29,7 @@ pub(crate) struct ParakeetTdtBackend {
 impl ParakeetTdtBackend {
     pub(crate) fn load(config: &TranscriberConfig) -> Result<Self> {
         validate_tdt_language(&config.language)?;
-        let model = JapaneseTdtModel::load(&config.model_dir, config.device)?;
+        let model = ParakeetTdtModel::load(&config.model_dir, config.device)?;
 
         Ok(Self {
             model,
