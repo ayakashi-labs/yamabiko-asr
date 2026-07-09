@@ -8,6 +8,7 @@ pub enum TranscriptEvent {
 }
 
 /// One transcription segment on the input audio timeline.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptSegment {
     pub text: String,
