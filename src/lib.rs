@@ -276,4 +276,19 @@ mod tests {
             Err(Error::InvalidLanguageHint(_))
         ));
     }
+
+    #[test]
+    fn device_parse_accepts_documented_values() {
+        assert_eq!("auto".parse::<Device>().unwrap(), Device::Auto);
+        assert_eq!("cpu".parse::<Device>().unwrap(), Device::Cpu);
+        assert_eq!("directml".parse::<Device>().unwrap(), Device::DirectMl);
+        assert_eq!("cuda".parse::<Device>().unwrap(), Device::Cuda);
+        assert_eq!("tensorrt".parse::<Device>().unwrap(), Device::TensorRt);
+        assert_eq!("openvino".parse::<Device>().unwrap(), Device::OpenVino);
+        assert_eq!("rocm".parse::<Device>().unwrap(), Device::Rocm);
+        assert_eq!("coreml".parse::<Device>().unwrap(), Device::CoreMl);
+        assert_eq!("xnnpack".parse::<Device>().unwrap(), Device::Xnnpack);
+        assert_eq!("onednn".parse::<Device>().unwrap(), Device::OneDnn);
+        assert!("bogus".parse::<Device>().is_err());
+    }
 }

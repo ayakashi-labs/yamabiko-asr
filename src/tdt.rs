@@ -1,5 +1,6 @@
 use crate::{Device, Error, PCM_SAMPLE_RATE_HZ, Result};
 use ndarray::{Array1, Array2, Array3};
+use ort::ep::ExecutionProviderDispatch;
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use realfft::RealToComplex;
 use std::f32::consts::PI;
@@ -239,21 +240,69 @@ fn build_session(model_path: &Path, device: Device) -> Result<Session> {
         .with_inter_threads(1)
         .map_err(|err| Error::ModelLoad(err.to_string()))?;
 
-    if device == Device::DirectMl {
-        builder = builder
-            .with_execution_providers([
-                ort::ep::DirectML::default().build(),
-                ort::ep::CPU::default().build().error_on_failure(),
-            ])
-            .map_err(|err| Error::DeviceUnavailable {
-                device,
-                message: err.to_string(),
-            })?;
-    }
+    builder = builder
+        .with_execution_providers(execution_providers_for(device))
+        .map_err(|err| Error::DeviceUnavailable {
+            device,
+            message: err.to_string(),
+        })?;
 
     builder
         .commit_from_file(model_path)
         .map_err(|err| Error::ModelLoad(err.to_string()))
+}
+
+fn execution_providers_for(device: Device) -> Vec<ExecutionProviderDispatch> {
+    match device {
+        Device::Cpu => vec![cpu_provider()],
+        Device::Auto => vec![
+            ort::ep::DirectML::default().build(),
+            ort::ep::CUDA::default().build(),
+            ort::ep::TensorRT::default().build(),
+            ort::ep::OpenVINO::default().build(),
+            ort::ep::ROCm::default().build(),
+            ort::ep::CoreML::default().build(),
+            ort::ep::XNNPACK::default().build(),
+            ort::ep::OneDNN::default().build(),
+            cpu_provider(),
+        ],
+        Device::DirectMl => vec![
+            ort::ep::DirectML::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+        Device::Cuda => vec![
+            ort::ep::CUDA::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+        Device::TensorRt => vec![
+            ort::ep::TensorRT::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+        Device::OpenVino => vec![
+            ort::ep::OpenVINO::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+        Device::Rocm => vec![
+            ort::ep::ROCm::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+        Device::CoreMl => vec![
+            ort::ep::CoreML::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+        Device::Xnnpack => vec![
+            ort::ep::XNNPACK::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+        Device::OneDnn => vec![
+            ort::ep::OneDNN::default().build().error_on_failure(),
+            cpu_provider(),
+        ],
+    }
+}
+
+fn cpu_provider() -> ExecutionProviderDispatch {
+    ort::ep::CPU::default().build().error_on_failure()
 }
 
 fn extract_state(value: &ort::value::Value, name: &str) -> Result<Array3<f32>> {

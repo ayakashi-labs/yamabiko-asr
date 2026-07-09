@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Required input sample rate for v0.1.
@@ -103,20 +104,62 @@ impl Language {
     }
 }
 
-/// Preferred execution device. Provider fallback follows the backend's
-/// capabilities and should be surfaced by backend errors when unavailable.
+/// Preferred execution device for the Parakeet TDT ONNX sessions.
+///
+/// `Auto` tries available accelerated providers before CPU. Explicit
+/// accelerator choices return a device error when their provider cannot be
+/// registered. Silero VAD uses its bundled default session in v0.1.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Device {
     #[default]
     Cpu,
+    Auto,
     DirectMl,
+    Cuda,
+    TensorRt,
+    OpenVino,
+    Rocm,
+    CoreMl,
+    Xnnpack,
+    OneDnn,
 }
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cpu => f.write_str("cpu"),
+            Self::Auto => f.write_str("auto"),
             Self::DirectMl => f.write_str("directml"),
+            Self::Cuda => f.write_str("cuda"),
+            Self::TensorRt => f.write_str("tensorrt"),
+            Self::OpenVino => f.write_str("openvino"),
+            Self::Rocm => f.write_str("rocm"),
+            Self::CoreMl => f.write_str("coreml"),
+            Self::Xnnpack => f.write_str("xnnpack"),
+            Self::OneDnn => f.write_str("onednn"),
+        }
+    }
+}
+
+impl FromStr for Device {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cpu" => Ok(Self::Cpu),
+            "auto" => Ok(Self::Auto),
+            "directml" | "dml" => Ok(Self::DirectMl),
+            "cuda" => Ok(Self::Cuda),
+            "tensorrt" | "trt" => Ok(Self::TensorRt),
+            "openvino" | "ov" => Ok(Self::OpenVino),
+            "rocm" => Ok(Self::Rocm),
+            "coreml" => Ok(Self::CoreMl),
+            "xnnpack" => Ok(Self::Xnnpack),
+            "onednn" | "dnnl" => Ok(Self::OneDnn),
+            other => Err(Error::InvalidConfig(format!(
+                "unsupported device '{other}'; expected one of auto, cpu, directml, cuda, tensorrt, openvino, rocm, coreml, xnnpack, onednn"
+            ))),
         }
     }
 }
