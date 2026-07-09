@@ -185,6 +185,26 @@ impl Default for VadConfig {
 }
 
 impl VadConfig {
+    pub fn with_threshold(mut self, threshold: f32) -> Self {
+        self.threshold = threshold;
+        self
+    }
+
+    pub fn with_min_speech(mut self, min_speech: Duration) -> Self {
+        self.min_speech = min_speech;
+        self
+    }
+
+    pub fn with_min_silence(mut self, min_silence: Duration) -> Self {
+        self.min_silence = min_silence;
+        self
+    }
+
+    pub fn with_speech_pad(mut self, speech_pad: Duration) -> Self {
+        self.speech_pad = speech_pad;
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(0.0..=1.0).contains(&self.threshold) || !self.threshold.is_finite() {
             return Err(Error::InvalidConfig(
@@ -236,6 +256,56 @@ impl TranscriberConfig {
         }
     }
 
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = device;
+        self
+    }
+
+    pub fn with_language(mut self, language: Language) -> Self {
+        self.language = language;
+        self
+    }
+
+    pub fn with_language_hint(mut self, hint: impl Into<String>) -> Result<Self> {
+        self.language = Language::hint(hint)?;
+        Ok(self)
+    }
+
+    pub fn with_vad(mut self, vad: VadConfig) -> Self {
+        self.vad = vad;
+        self
+    }
+
+    pub fn with_vad_threshold(mut self, threshold: f32) -> Self {
+        self.vad.threshold = threshold;
+        self
+    }
+
+    pub fn with_vad_min_speech(mut self, min_speech: Duration) -> Self {
+        self.vad.min_speech = min_speech;
+        self
+    }
+
+    pub fn with_vad_min_silence(mut self, min_silence: Duration) -> Self {
+        self.vad.min_silence = min_silence;
+        self
+    }
+
+    pub fn with_vad_speech_pad(mut self, speech_pad: Duration) -> Self {
+        self.vad.speech_pad = speech_pad;
+        self
+    }
+
+    pub fn with_pcm_format(mut self, pcm_format: PcmFormat) -> Self {
+        self.pcm_format = pcm_format;
+        self
+    }
+
+    pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
+        self.channel_capacity = channel_capacity;
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.model_dir.as_os_str().is_empty() {
             return Err(Error::InvalidConfig(
@@ -250,5 +320,39 @@ impl TranscriberConfig {
         self.pcm_format.validate()?;
         self.language.validate()?;
         self.vad.validate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_builder_methods_set_values() {
+        let vad = VadConfig::default()
+            .with_threshold(0.4)
+            .with_min_speech(Duration::from_millis(300))
+            .with_min_silence(Duration::from_millis(800))
+            .with_speech_pad(Duration::from_millis(40));
+
+        let config = TranscriberConfig::new("model")
+            .with_device(Device::Auto)
+            .with_language(Language::Auto)
+            .with_vad(vad.clone())
+            .with_channel_capacity(8);
+
+        assert_eq!(config.device, Device::Auto);
+        assert_eq!(config.language, Language::Auto);
+        assert_eq!(config.vad, vad);
+        assert_eq!(config.channel_capacity, 8);
+    }
+
+    #[test]
+    fn config_builder_accepts_language_hint() {
+        let config = TranscriberConfig::new("model")
+            .with_language_hint("ja")
+            .unwrap();
+
+        assert_eq!(config.language, Language::Hint("ja-JP".to_string()));
     }
 }
