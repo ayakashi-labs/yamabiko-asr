@@ -5,6 +5,7 @@
 //! download stay with the application.
 
 mod backend;
+mod builder;
 mod config;
 mod error;
 mod event;
@@ -12,6 +13,7 @@ mod session;
 mod tdt;
 mod vad;
 
+pub use builder::{TranscriberBuilder, VadConfigBuilder};
 pub use config::{
     Device, Language, PCM_CHANNELS, PCM_SAMPLE_RATE_HZ, PcmChunk, PcmFormat, TranscriberConfig,
     VadConfig,

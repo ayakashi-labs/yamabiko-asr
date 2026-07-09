@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use asr_crate::{Device, Language, TranscriberConfig, TranscriptEvent};
+use asr_crate::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
 use std::error::Error;
 use std::time::Duration;
 
@@ -78,26 +78,26 @@ pub fn parse_args(usage: &str, extra_positionals: usize) -> ExampleResult<Exampl
 }
 
 pub fn transcriber_config(args: &ExampleArgs) -> ExampleResult<TranscriberConfig> {
-    let mut config = TranscriberConfig::new(&args.model_dir);
+    let mut builder = Transcriber::builder(&args.model_dir);
     if let Some(device) = args.device {
-        config.device = device;
+        builder = builder.device(device);
     }
     if let Some(language) = &args.language {
-        config.language = Language::hint(language)?;
+        builder = builder.language_hint(language)?;
     }
     if let Some(threshold) = args.vad_threshold {
-        config.vad.threshold = threshold;
+        builder = builder.vad_threshold(threshold);
     }
     if let Some(ms) = args.vad_min_speech_ms {
-        config.vad.min_speech = Duration::from_millis(ms);
+        builder = builder.vad_min_speech(Duration::from_millis(ms));
     }
     if let Some(ms) = args.vad_min_silence_ms {
-        config.vad.min_silence = Duration::from_millis(ms);
+        builder = builder.vad_min_silence(Duration::from_millis(ms));
     }
     if let Some(ms) = args.vad_speech_pad_ms {
-        config.vad.speech_pad = Duration::from_millis(ms);
+        builder = builder.vad_speech_pad(Duration::from_millis(ms));
     }
-    Ok(config)
+    Ok(builder.build_config()?)
 }
 
 pub fn print_segment(event: TranscriptEvent) -> bool {

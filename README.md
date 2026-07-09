@@ -19,11 +19,10 @@ uses a local ONNX runner for Parakeet TDT models.
 ## Minimal Shape
 
 ```rust,no_run
-use asr_crate::{PcmChunk, TranscriptEvent, Transcriber, TranscriberConfig};
+use asr_crate::{PcmChunk, TranscriptEvent, Transcriber};
 
 # async fn run() -> asr_crate::Result<()> {
-let config = TranscriberConfig::new("path/to/parakeet-tdt-model");
-let transcriber = Transcriber::new(config)?;
+let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
 let (input, mut events) = transcriber.start().into_channels();
 
 input.send(PcmChunk::new(vec![0.0; 1600])).await.unwrap();
