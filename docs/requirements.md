@@ -18,8 +18,14 @@ features. Users provide the PCM input pipeline and compatible local model files.
   speech padding.
 - Support automatic language selection plus explicit `ja`/`ja-JP` hints for the
   current Japanese Parakeet TDT path.
-- Let callers explicitly select CPU or DirectML execution. Provider fallback
-  follows the behavior of the ONNX Runtime backend.
+- Let callers explicitly select the Parakeet TDT ONNX execution device. v0.1
+  supports `cpu`, `auto`, `directml`, `cuda`, `tensorrt`, `openvino`, `rocm`,
+  `coreml`, `xnnpack`, and `onednn` in the public API. Non-CPU providers
+  require matching Cargo features and runtime libraries. The default build and
+  default `Device` use CPU. `auto` may fall back to CPU; explicit accelerator
+  choices should surface registration failures as device errors. WebGPU is not
+  exposed in v0.1 because the current ORT package does not link reliably with
+  all enabled features on Windows.
 - Support `nvidia/parakeet-tdt_ctc-0.6b-ja` as the first model target. The
   current backend emits only final utterance results after VAD closes a speech
   segment.
@@ -54,4 +60,5 @@ features. Users provide the PCM input pipeline and compatible local model files.
 - Tests should cover VAD gating, timestamp continuity, stream event order,
   configuration validation, and Parakeet TDT VAD chunking behavior.
 - Examples should include WAV pseudo-streaming, Windows-oriented microphone
-  input, VAD tuning flags, and documented model conversion commands.
+  input, VAD tuning flags, device selection flags, and documented model
+  conversion commands.

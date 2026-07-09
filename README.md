@@ -9,7 +9,9 @@ uses a local ONNX runner for Parakeet TDT models.
 - Tokio-based streaming input/output API.
 - Input timestamps are preserved even when VAD removes silent audio before ASR.
 - Output events currently contain VAD-final utterance segments.
-- CPU and DirectML execution can be selected explicitly.
+- ASR execution device can be selected explicitly: `cpu`, `auto`,
+  `directml`, `cuda`, `tensorrt`, `openvino`, `rocm`, `coreml`, `xnnpack`,
+  or `onednn`.
 - Current model path: `nvidia/parakeet-tdt_ctc-0.6b-ja` exported to ONNX.
 - Audio capture, resampling, downmixing, and model download are application
   responsibilities.
@@ -45,5 +47,14 @@ cargo run --example microphone -- --vad-min-silence-ms 800 .\models\parakeet-tdt
 
 The local ONNX runner is used because `nvidia/parakeet-tdt_ctc-0.6b-ja`
 expects 80 mel features.
+
+The default build uses CPU execution. ONNX Runtime acceleration providers are
+opt-in Cargo features, for example:
+
+```powershell
+cargo run --features directml --example microphone -- --device directml .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --features cuda --example microphone -- --device cuda .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --features openvino --example microphone -- --device openvino .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+```
 
 See `docs/requirements.md` for the current requirements and future scope.
