@@ -1,26 +1,16 @@
-use asr_crate::{Device, Language, PcmChunk, Transcriber, TranscriberConfig, TranscriptEvent};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Fft, FixedSync, Resampler};
-use std::collections::VecDeque;
-use std::error::Error;
-use std::time::{Duration, Instant};
+mod common;
 
-const TARGET_SAMPLE_RATE: u32 = 16_000;
-const ASR_CHUNK_SAMPLES: usize = 1_600;
+use asr_crate::{PcmChunk, Transcriber};
+use common::audio::{ASR_CHUNK_SAMPLES, MicResampler, TARGET_SAMPLE_RATE, downmix_to_mono, rms};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::time::Instant;
+
+const USAGE: &str = "usage: microphone [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> [language]";
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let args = parse_args()?;
-
-    let mut config = TranscriberConfig::new(&args.model_dir);
-    apply_vad_args(&mut config, &args);
-    if let Some(device) = args.device {
-        config.device = device;
-    }
-    if let Some(language) = args.language {
-        config.language = Language::hint(language)?;
-    }
+async fn main() -> common::ExampleResult<()> {
+    let args = common::parse_args(USAGE, 0)?;
+    let config = common::transcriber_config(&args)?;
     eprintln!("[asr] model dir: {}", config.model_dir.display());
     eprintln!("[asr] device: {}", config.device);
     eprintln!("[asr] language: {:?}", config.language);
@@ -127,215 +117,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     eprintln!("[asr] listening; speak into the microphone, press Ctrl+C to stop");
 
     while let Some(event) = events.recv().await {
-        match event? {
-            TranscriptEvent::Segment(segment) => {
-                let state = if segment.is_final { "final" } else { "partial" };
-                eprintln!(
-                    "[asr] backend emitted {state} text ({:.2?}..{:.2?})",
-                    segment.start, segment.end
-                );
-                println!("[{}] {}", state, segment.text);
-            }
-            TranscriptEvent::EndOfStream => {
-                eprintln!("[asr] end of stream");
-                break;
-            }
+        if !common::print_segment(event?) {
+            eprintln!("[asr] end of stream");
+            break;
         }
     }
 
     Ok(())
-}
-
-struct ExampleArgs {
-    model_dir: String,
-    language: Option<String>,
-    device: Option<Device>,
-    vad_threshold: Option<f32>,
-    vad_min_speech_ms: Option<u64>,
-    vad_min_silence_ms: Option<u64>,
-    vad_speech_pad_ms: Option<u64>,
-}
-
-fn parse_args() -> Result<ExampleArgs, Box<dyn Error + Send + Sync>> {
-    let mut device = None;
-    let mut vad_threshold = None;
-    let mut vad_min_speech_ms = None;
-    let mut vad_min_silence_ms = None;
-    let mut vad_speech_pad_ms = None;
-    let mut positional = Vec::new();
-    let mut args = std::env::args().skip(1);
-
-    while let Some(arg) = args.next() {
-        if arg == "--device" {
-            device = Some(parse_device_arg(&arg, args.next())?);
-        } else if let Some(value) = arg.strip_prefix("--device=") {
-            device = Some(value.parse()?);
-        } else if arg == "--vad-threshold" {
-            vad_threshold = Some(parse_f32_arg(&arg, args.next())?);
-        } else if let Some(value) = arg.strip_prefix("--vad-threshold=") {
-            vad_threshold = Some(value.parse()?);
-        } else if arg == "--vad-min-speech-ms" {
-            vad_min_speech_ms = Some(parse_u64_arg(&arg, args.next())?);
-        } else if let Some(value) = arg.strip_prefix("--vad-min-speech-ms=") {
-            vad_min_speech_ms = Some(value.parse()?);
-        } else if arg == "--vad-min-silence-ms" {
-            vad_min_silence_ms = Some(parse_u64_arg(&arg, args.next())?);
-        } else if let Some(value) = arg.strip_prefix("--vad-min-silence-ms=") {
-            vad_min_silence_ms = Some(value.parse()?);
-        } else if arg == "--vad-speech-pad-ms" {
-            vad_speech_pad_ms = Some(parse_u64_arg(&arg, args.next())?);
-        } else if let Some(value) = arg.strip_prefix("--vad-speech-pad-ms=") {
-            vad_speech_pad_ms = Some(value.parse()?);
-        } else {
-            positional.push(arg);
-        }
-    }
-
-    if positional.is_empty() || positional.len() > 2 {
-        return Err(
-            "usage: microphone [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> [language]"
-                .into(),
-        );
-    }
-
-    Ok(ExampleArgs {
-        model_dir: positional.remove(0),
-        language: positional.pop(),
-        device,
-        vad_threshold,
-        vad_min_speech_ms,
-        vad_min_silence_ms,
-        vad_speech_pad_ms,
-    })
-}
-
-fn apply_vad_args(config: &mut TranscriberConfig, args: &ExampleArgs) {
-    if let Some(threshold) = args.vad_threshold {
-        config.vad.threshold = threshold;
-    }
-    if let Some(ms) = args.vad_min_speech_ms {
-        config.vad.min_speech = Duration::from_millis(ms);
-    }
-    if let Some(ms) = args.vad_min_silence_ms {
-        config.vad.min_silence = Duration::from_millis(ms);
-    }
-    if let Some(ms) = args.vad_speech_pad_ms {
-        config.vad.speech_pad = Duration::from_millis(ms);
-    }
-}
-
-fn parse_device_arg(
-    name: &str,
-    value: Option<String>,
-) -> Result<Device, Box<dyn Error + Send + Sync>> {
-    value
-        .ok_or_else(|| format!("missing value for {name}"))?
-        .parse()
-        .map_err(Into::into)
-}
-
-fn parse_f32_arg(name: &str, value: Option<String>) -> Result<f32, Box<dyn Error + Send + Sync>> {
-    value
-        .ok_or_else(|| format!("missing value for {name}"))?
-        .parse()
-        .map_err(Into::into)
-}
-
-fn parse_u64_arg(name: &str, value: Option<String>) -> Result<u64, Box<dyn Error + Send + Sync>> {
-    value
-        .ok_or_else(|| format!("missing value for {name}"))?
-        .parse()
-        .map_err(Into::into)
-}
-
-struct MicResampler {
-    inner: Option<Fft<f32>>,
-    pending: VecDeque<f32>,
-}
-
-impl MicResampler {
-    fn new(input_sample_rate: u32) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let inner = if input_sample_rate == TARGET_SAMPLE_RATE {
-            None
-        } else {
-            Some(Fft::<f32>::new(
-                input_sample_rate as usize,
-                TARGET_SAMPLE_RATE as usize,
-                (input_sample_rate as usize / 100).max(1),
-                2,
-                1,
-                FixedSync::Input,
-            )?)
-        };
-
-        Ok(Self {
-            inner,
-            pending: VecDeque::new(),
-        })
-    }
-
-    fn push(&mut self, samples: &[f32]) -> Result<Vec<Vec<f32>>, Box<dyn Error + Send + Sync>> {
-        let Some(resampler) = self.inner.as_mut() else {
-            return Ok(vec![samples.to_vec()]);
-        };
-
-        self.pending.extend(samples.iter().copied());
-        let mut out = Vec::new();
-        while self.pending.len() >= resampler.input_frames_next() {
-            let input_len = resampler.input_frames_next();
-            let input = self.pending.drain(..input_len).collect::<Vec<_>>();
-            let input_adapter = InterleavedSlice::new(&input, 1, input_len)?;
-            let output = resampler.process(&input_adapter, 0, None)?;
-            out.push(output.take_data());
-        }
-        Ok(out)
-    }
-
-    fn finish(&mut self) -> Result<Vec<Vec<f32>>, Box<dyn Error + Send + Sync>> {
-        let Some(resampler) = self.inner.as_mut() else {
-            if self.pending.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Ok(vec![self.pending.drain(..).collect()]);
-        };
-
-        let input_len = self.pending.len();
-        if input_len == 0 {
-            return Ok(Vec::new());
-        }
-
-        let input = self.pending.drain(..).collect::<Vec<_>>();
-        let input_adapter = InterleavedSlice::new(&input, 1, input_len)?;
-        let mut output = vec![0.0; resampler.output_frames_next()];
-        let out_capacity = output.len();
-        let mut output_adapter = InterleavedSlice::new_mut(&mut output, 1, out_capacity)?;
-        let indexing = rubato::Indexing {
-            input_offset: 0,
-            output_offset: 0,
-            active_channels_mask: None,
-            partial_len: Some(input_len),
-        };
-        let (_, frames_written) =
-            resampler.process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))?;
-        output.truncate(frames_written);
-        Ok(vec![output])
-    }
-}
-
-fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 {
-        return data.to_vec();
-    }
-
-    data.chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
-}
-
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum = samples.iter().map(|sample| sample * sample).sum::<f32>();
-    (sum / samples.len() as f32).sqrt()
 }
