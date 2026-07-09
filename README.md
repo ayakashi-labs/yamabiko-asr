@@ -31,10 +31,21 @@ drop(input);
 
 while let Some(event) = events.recv().await {
     if let TranscriptEvent::Segment(segment) = event? {
-        println!("{}", segment.text);
+        println!("{}ms: {}", segment.start_ms(), segment.text);
     }
 }
 # Ok(())
+# }
+```
+
+For Tauri-style UI events, enable the optional `serde` feature and emit the
+millisecond payload:
+
+```rust,no_run
+# use asr_crate::{TranscriptEvent, TranscriptSegmentPayload};
+# fn emit_to_ui(segment: &asr_crate::TranscriptSegment) {
+let payload: TranscriptSegmentPayload = segment.to_payload();
+// app.emit("transcript-segment", payload)?;
 # }
 ```
 

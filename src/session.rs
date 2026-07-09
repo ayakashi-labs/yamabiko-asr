@@ -5,13 +5,16 @@ use crate::{Error, PcmChunk, Result, TranscriberConfig};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// Join handle for the blocking transcription worker.
+pub type TranscriptionWorker = JoinHandle<()>;
+
 /// Running Tokio session for one transcriber.
 pub struct TranscriptionSession {
     /// Send f32 mono 16 kHz PCM chunks here.
     pub input: mpsc::Sender<PcmChunk>,
     /// Receive transcript events and recoverable/fatal errors here.
     pub events: mpsc::Receiver<Result<TranscriptEvent>>,
-    pub(crate) worker: JoinHandle<()>,
+    pub(crate) worker: TranscriptionWorker,
 }
 
 impl TranscriptionSession {
@@ -27,6 +30,20 @@ impl TranscriptionSession {
         mpsc::Receiver<Result<TranscriptEvent>>,
     ) {
         (self.input, self.events)
+    }
+
+    /// Split the session into input, output, and worker handle.
+    ///
+    /// Prefer this over `into_channels` when an application needs to wait for
+    /// clean shutdown, such as when a Tauri window or recording session stops.
+    pub fn into_parts(
+        self,
+    ) -> (
+        mpsc::Sender<PcmChunk>,
+        mpsc::Receiver<Result<TranscriptEvent>>,
+        TranscriptionWorker,
+    ) {
+        (self.input, self.events, self.worker)
     }
 
     /// Wait for the blocking transcription worker to exit.

@@ -17,8 +17,10 @@ pub use config::{
     VadConfig,
 };
 pub use error::{Error, Result};
-pub use event::{TranscriptEvent, TranscriptSegment};
-pub use session::TranscriptionSession;
+pub use event::{
+    TranscriptEvent, TranscriptEventPayload, TranscriptSegment, TranscriptSegmentPayload,
+};
+pub use session::{TranscriptionSession, TranscriptionWorker};
 
 use backend::ParakeetTdtBackend;
 use session::run_transcription_worker;
@@ -247,6 +249,24 @@ mod tests {
             TranscriptEvent::Segment(TranscriptSegment { is_final: true, .. })
         ));
         assert!(matches!(second, TranscriptEvent::EndOfStream));
+    }
+
+    #[tokio::test]
+    async fn session_into_parts_keeps_worker_joinable() {
+        let backend = FakeBackend {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            next: 0,
+        };
+        let vad = FakeVad { chunks: Vec::new() };
+        let transcriber =
+            Transcriber::from_parts(test_config(), Box::new(backend), Box::new(vad)).unwrap();
+
+        let (input, mut events, worker) = transcriber.start().into_parts();
+        drop(input);
+
+        let event = events.recv().await.unwrap().unwrap();
+        assert!(matches!(event, TranscriptEvent::EndOfStream));
+        worker.await.unwrap();
     }
 
     #[test]

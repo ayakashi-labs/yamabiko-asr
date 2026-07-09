@@ -14,11 +14,13 @@ openvino = ["ort/openvino", "silero/openvino"]
 rocm = ["ort/rocm", "silero/rocm"]
 tensorrt = ["ort/tensorrt", "silero/tensorrt"]
 xnnpack = ["ort/xnnpack"]
+serde = ["dep:serde"]
 
 [dependencies]
 ndarray = "0.17.2"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24"] }
 realfft = "3.5.0"
+serde = { version = "1.0.228", features = ["derive"], optional = true }
 silero = { version = "0.4.0", default-features = false, features = ["bundled"] }
 tokio = { version = "1.52.3", features = ["rt", "macros", "sync"] }
 
