@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use yamabiko_asr::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
 use std::error::Error;
 use std::time::Duration;
+use yamabiko_asr::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
 
 pub mod audio;
 

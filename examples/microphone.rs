@@ -1,9 +1,9 @@
 mod common;
 
-use yamabiko_asr::{PcmChunk, Transcriber};
 use common::audio::{ASR_CHUNK_SAMPLES, MicResampler, TARGET_SAMPLE_RATE, downmix_to_mono, rms};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::time::Instant;
+use yamabiko_asr::{PcmChunk, Transcriber};
 
 const USAGE: &str = "usage: microphone [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> [language]";
 
