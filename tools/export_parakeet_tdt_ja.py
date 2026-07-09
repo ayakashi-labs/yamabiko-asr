@@ -204,9 +204,10 @@ def write_vocab(model, dest: Path) -> None:
 
 
 def write_model_source(model_id: str, output_dir: Path) -> None:
+    model_url = model_id if "/" in model_id and not Path(model_id).exists() else DEFAULT_MODEL
     content = (
-        "Source model: nvidia/parakeet-tdt_ctc-0.6b-ja\n"
-        "Upstream URL: https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja\n"
+        f"Source model: {model_url}\n"
+        f"Upstream URL: https://huggingface.co/{model_url}\n"
         "Upstream license: CC-BY-4.0\n"
         f"Export input: {model_id}\n"
     )
