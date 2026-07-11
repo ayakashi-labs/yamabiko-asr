@@ -24,7 +24,7 @@ async fn main() -> common::ExampleResult<()> {
     });
 
     while let Some(event) = events.recv().await {
-        if !common::print_timed_segment(event?) {
+        if !common::print_segment(event?) {
             break;
         }
     }
