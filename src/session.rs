@@ -2,6 +2,7 @@ use crate::backend::{AsrBackend, BackendTranscript};
 use crate::event::{TranscriptEvent, TranscriptSegment};
 use crate::vad::{SpeechChunk, VadGate, duration_from_samples};
 use crate::{Error, PcmChunk, Result, TranscriberConfig};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -97,9 +98,10 @@ pub(crate) fn run_transcription_worker(
         return;
     }
 
+    let started = Instant::now();
     match backend.flush(next_input_sample) {
         Ok(transcripts) => {
-            if !send_transcripts(&event_tx, transcripts) {
+            if !send_transcripts(&event_tx, transcripts, started.elapsed()) {
                 return;
             }
         }
@@ -119,6 +121,7 @@ fn handle_speech_chunks(
     chunks: Vec<SpeechChunk>,
 ) -> bool {
     for speech in chunks {
+        let started = Instant::now();
         let transcripts = match backend.accept_speech(&speech, &config.language) {
             Ok(transcripts) => transcripts,
             Err(err) => {
@@ -127,7 +130,7 @@ fn handle_speech_chunks(
             }
         };
 
-        if !send_transcripts(event_tx, transcripts) {
+        if !send_transcripts(event_tx, transcripts, started.elapsed()) {
             return false;
         }
     }
@@ -138,6 +141,7 @@ fn handle_speech_chunks(
 fn send_transcripts(
     event_tx: &mpsc::Sender<Result<TranscriptEvent>>,
     transcripts: Vec<BackendTranscript>,
+    inference_duration: Duration,
 ) -> bool {
     for transcript in transcripts {
         if transcript.text.trim().is_empty() {
@@ -148,6 +152,7 @@ fn send_transcripts(
             text: transcript.text,
             start: duration_from_samples(transcript.start_sample),
             end: duration_from_samples(transcript.end_sample),
+            inference_duration,
             is_final: transcript.is_final,
         };
 
