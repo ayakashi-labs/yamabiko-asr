@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use chrono::Local;
 use std::error::Error;
 use std::time::Duration;
 use yamabiko_asr::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
@@ -7,6 +8,10 @@ use yamabiko_asr::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
 pub mod audio;
 
 pub type ExampleResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+pub fn local_time() -> String {
+    Local::now().format("%H:%M:%S").to_string()
+}
 
 pub struct ExampleArgs {
     pub model_dir: String,
@@ -103,25 +108,17 @@ pub fn transcriber_config(args: &ExampleArgs) -> ExampleResult<TranscriberConfig
 pub fn print_segment(event: TranscriptEvent) -> bool {
     match event {
         TranscriptEvent::Segment(segment) => {
-            let state = if segment.is_final { "final" } else { "partial" };
-            eprintln!(
-                "[asr] backend emitted {state} text ({:.2?}..{:.2?})",
-                segment.start, segment.end
-            );
-            println!("[{}] {}", state, segment.text);
-            true
-        }
-        TranscriptEvent::EndOfStream => false,
-    }
-}
+            let inference_seconds = segment.inference_duration.as_secs_f64();
+            let audio_seconds = segment.end.saturating_sub(segment.start).as_secs_f64();
+            let rtf = if audio_seconds > 0.0 {
+                inference_seconds / audio_seconds
+            } else {
+                0.0
+            };
 
-pub fn print_timed_segment(event: TranscriptEvent) -> bool {
-    match event {
-        TranscriptEvent::Segment(segment) => {
-            let state = if segment.is_final { "final" } else { "partial" };
+            println!("[{}] {}", local_time(), segment.text);
             println!(
-                "[{} {:.2?}..{:.2?}] {}",
-                state, segment.start, segment.end, segment.text
+                "  Inference {inference_seconds:.2}s / Audio {audio_seconds:.2}s / RTF {rtf:.2}"
             );
             true
         }
