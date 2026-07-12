@@ -26,6 +26,9 @@ yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
 - Additional sources are registered explicitly and limited by `max_sources`
   (default: 2, including the primary input). Closing one source flushes and
   releases only that source.
+- Sources can be anchored to a shared session timeline with `send_at`; plain
+  `send` starts an unanchored source at session time zero and then advances by
+  its PCM sample count.
 - Input timestamps are preserved even when VAD removes silent audio before ASR.
 - Output events currently contain VAD-final utterance segments.
 - ASR execution device can be selected explicitly: `cpu`, `auto`,
@@ -88,8 +91,10 @@ let payload: TranscriptSegmentPayload = segment.to_payload();
 
 Multiple capture streams can share the same loaded ASR model. Register each
 additional stream explicitly; closing one input flushes and releases only that
-source. Segment timestamps remain source-local and emitted segments carry the
-allocated source identifier. Each segment also has a stable `SegmentId`;
+source. Segment timestamps use a shared session timeline and emitted segments
+carry the allocated source identifier. `send_at` timestamps must align to a
+16 kHz sample boundary; after anchoring the first chunk, plain `send` advances
+continuously by sample count. Each segment also has a stable `SegmentId`;
 consumers should upsert by that ID so later text or speaker revisions can
 replace an earlier version:
 
@@ -107,7 +112,12 @@ let (microphone, mut events, worker) = session.into_parts();
 
 let producer = tokio::spawn(async move {
     microphone.send(PcmChunk::new(vec![0.0; 1600])).await?;
-    system_audio.send(PcmChunk::new(vec![0.0; 1600])).await?;
+    system_audio
+        .send_at(
+            std::time::Duration::from_millis(350),
+            PcmChunk::new(vec![0.0; 1600]),
+        )
+        .await?;
 
     system_audio.close().await?;
     microphone.close().await
