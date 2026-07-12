@@ -1,6 +1,6 @@
 mod common;
 
-use common::audio::{ASR_CHUNK_SAMPLES, MicResampler, TARGET_SAMPLE_RATE, downmix_to_mono};
+use common::audio::{ASR_CHUNK_SAMPLES, AudioResampler, TARGET_SAMPLE_RATE, downmix_to_mono};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::time::Instant;
 use yamabiko_asr::{Language, PcmChunk, Transcriber};
@@ -67,7 +67,7 @@ async fn main() -> common::ExampleResult<()> {
     println!("  Execution {execution} / Language {language}");
     let (input, mut events, worker) = transcriber.start().into_parts();
     let audio_forwarder = std::thread::spawn(move || {
-        let mut resampler = match MicResampler::new(input_sample_rate) {
+        let mut resampler = match AudioResampler::new(input_sample_rate) {
             Ok(resampler) => resampler,
             Err(err) => {
                 eprintln!("failed to create resampler: {err}");

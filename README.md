@@ -92,18 +92,20 @@ let payload: TranscriptSegmentPayload = segment.to_payload();
 Multiple capture streams can share the same loaded ASR model. Register each
 additional stream explicitly; closing one input flushes and releases only that
 source. Segment timestamps use a shared session timeline and emitted segments
-carry the allocated source identifier. `send_at` timestamps must align to a
-16 kHz sample boundary; after anchoring the first chunk, plain `send` advances
-continuously by sample count. Each segment also has a stable `SegmentId`;
+carry the allocated source identifier. `send_at` timestamps are rounded down
+to a 16 kHz sample boundary; after anchoring the first chunk, plain `send`
+advances continuously by sample count. Each segment also has a stable `SegmentId`;
 consumers should upsert by that ID so later text or speaker revisions can
 replace an earlier version:
 
 ```rust,no_run
+use std::time::Instant;
 use yamabiko_asr::{AudioSourceConfig, PcmChunk, TranscriptEvent, Transcriber};
 
 # async fn send_audio(
 #     transcriber: Transcriber,
 # ) -> yamabiko_asr::Result<()> {
+let session_started = Instant::now();
 let session = transcriber.start();
 let system_audio = session
     .open_source(AudioSourceConfig::system_audio())
@@ -112,11 +114,9 @@ let (microphone, mut events, worker) = session.into_parts();
 
 let producer = tokio::spawn(async move {
     microphone.send(PcmChunk::new(vec![0.0; 1600])).await?;
+    let system_started_at = session_started.elapsed();
     system_audio
-        .send_at(
-            std::time::Duration::from_millis(350),
-            PcmChunk::new(vec![0.0; 1600]),
-        )
+        .send_at(system_started_at, PcmChunk::new(vec![0.0; 1600]))
         .await?;
 
     system_audio.close().await?;
@@ -138,6 +138,31 @@ worker
 # Ok(())
 # }
 ```
+
+## System Audio Loopback
+
+On Windows, CPAL can open the default output device as a WASAPI loopback input
+stream. The `system_audio` example downmixes and resamples that stream to f32
+mono 16 kHz, anchors its first chunk using the WASAPI capture timestamp, and
+transcribes it with the same streaming API:
+
+```powershell
+cargo run --example system_audio -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+```
+
+Play audio through the default output device, then press Ctrl+C to flush the
+final segment and stop. The example currently expects the output mix format to
+be f32 and supports only Windows.
+
+To capture the default microphone and system audio at the same time with one
+loaded model, run the combined example:
+
+```powershell
+cargo run --example microphone_and_system_audio -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+```
+
+Its output is labeled `[microphone]` or `[system]` using each segment's source
+identifier. Both capture devices must expose an f32 default format.
 
 For the Japanese Parakeet TDT model, export ONNX files first:
 

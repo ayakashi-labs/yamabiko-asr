@@ -4,16 +4,18 @@ use super::ExampleResult;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use std::collections::VecDeque;
+#[cfg(target_os = "windows")]
+use std::time::{Duration, Instant};
 
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 pub const ASR_CHUNK_SAMPLES: usize = 1_600;
 
-pub struct MicResampler {
+pub struct AudioResampler {
     inner: Option<Fft<f32>>,
     pending: VecDeque<f32>,
 }
 
-impl MicResampler {
+impl AudioResampler {
     pub fn new(input_sample_rate: u32) -> ExampleResult<Self> {
         let inner = if input_sample_rate == TARGET_SAMPLE_RATE {
             None
@@ -112,6 +114,13 @@ pub fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
     data.chunks_exact(channels)
         .map(|frame| frame.iter().sum::<f32>() / channels as f32)
         .collect()
+}
+
+#[cfg(target_os = "windows")]
+pub fn wasapi_capture_time(session_started: Instant, info: &cpal::InputCallbackInfo) -> Duration {
+    let timestamp = info.timestamp();
+    let capture_delay = timestamp.callback.duration_since(timestamp.capture);
+    session_started.elapsed().saturating_sub(capture_delay)
 }
 
 pub fn rms(samples: &[f32]) -> f32 {
