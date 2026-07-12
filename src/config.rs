@@ -46,7 +46,68 @@ impl fmt::Display for PcmFormat {
     }
 }
 
-/// One chunk of f32 PCM on the input audio timeline.
+/// Stable identifier for one audio source in a transcription session.
+///
+/// Source `0` is reserved for the primary input. Additional identifiers are
+/// allocated by `TranscriptionSession::open_source`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AudioSourceId(u64);
+
+impl AudioSourceId {
+    /// The default source used by `PcmChunk::new`.
+    pub const PRIMARY: Self = Self(0);
+
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the numeric representation used in UI payloads.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Application-level role of an audio source.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AudioSourceKind {
+    Microphone,
+    SystemAudio,
+    #[default]
+    Other,
+}
+
+/// Configuration used when registering an additional audio source.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioSourceConfig {
+    pub kind: AudioSourceKind,
+}
+
+impl AudioSourceConfig {
+    pub fn microphone() -> Self {
+        Self {
+            kind: AudioSourceKind::Microphone,
+        }
+    }
+
+    pub fn system_audio() -> Self {
+        Self {
+            kind: AudioSourceKind::SystemAudio,
+        }
+    }
+
+    pub fn other() -> Self {
+        Self::default()
+    }
+}
+
+/// One chunk of f32 PCM on its source-local audio timeline.
+///
+/// Chunks for each source must be sent in capture order. Every source has an
+/// independent sample counter starting at zero.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PcmChunk {
     pub samples: Vec<f32>,
@@ -67,6 +128,7 @@ impl PcmChunk {
 }
 
 /// Optional language target for multilingual models.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Language {
     #[default]
@@ -165,6 +227,7 @@ impl FromStr for Device {
 }
 
 /// Voice activity detection settings exposed by v0.1.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct VadConfig {
     pub threshold: f32,
@@ -234,6 +297,7 @@ fn normalize_language_hint(hint: &str) -> String {
 }
 
 /// Configuration for loading and running one Parakeet TDT transcriber.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriberConfig {
     pub model_dir: PathBuf,
@@ -242,6 +306,7 @@ pub struct TranscriberConfig {
     pub vad: VadConfig,
     pub pcm_format: PcmFormat,
     pub channel_capacity: usize,
+    pub max_sources: usize,
 }
 
 impl TranscriberConfig {
@@ -253,6 +318,7 @@ impl TranscriberConfig {
             vad: VadConfig::default(),
             pcm_format: PcmFormat::default(),
             channel_capacity: 32,
+            max_sources: 2,
         }
     }
 
@@ -306,6 +372,11 @@ impl TranscriberConfig {
         self
     }
 
+    pub fn with_max_sources(mut self, max_sources: usize) -> Self {
+        self.max_sources = max_sources;
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.model_dir.as_os_str().is_empty() {
             return Err(Error::InvalidConfig(
@@ -315,6 +386,11 @@ impl TranscriberConfig {
         if self.channel_capacity == 0 {
             return Err(Error::InvalidConfig(
                 "channel_capacity must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_sources == 0 {
+            return Err(Error::InvalidConfig(
+                "max_sources must be greater than zero".to_string(),
             ));
         }
         self.pcm_format.validate()?;
@@ -339,12 +415,14 @@ mod tests {
             .with_device(Device::Auto)
             .with_language(Language::Auto)
             .with_vad(vad.clone())
-            .with_channel_capacity(8);
+            .with_channel_capacity(8)
+            .with_max_sources(4);
 
         assert_eq!(config.device, Device::Auto);
         assert_eq!(config.language, Language::Auto);
         assert_eq!(config.vad, vad);
         assert_eq!(config.channel_capacity, 8);
+        assert_eq!(config.max_sources, 4);
     }
 
     #[test]
@@ -354,5 +432,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.language, Language::Hint("ja-JP".to_string()));
+    }
+
+    #[test]
+    fn config_rejects_zero_max_sources() {
+        let config = TranscriberConfig::new("model").with_max_sources(0);
+        assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
     }
 }

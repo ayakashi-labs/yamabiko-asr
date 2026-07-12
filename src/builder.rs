@@ -70,6 +70,11 @@ impl TranscriberBuilder {
         self
     }
 
+    pub fn max_sources(mut self, max_sources: usize) -> Self {
+        self.config.max_sources = max_sources;
+        self
+    }
+
     pub fn build_config(self) -> Result<TranscriberConfig> {
         self.config.validate()?;
         Ok(self.config)
@@ -143,6 +148,7 @@ mod tests {
                     .speech_pad(Duration::from_millis(40))
             })
             .channel_capacity(8)
+            .max_sources(4)
             .build_config()
             .unwrap();
 
@@ -153,6 +159,7 @@ mod tests {
         assert_eq!(config.vad.min_silence, Duration::from_millis(800));
         assert_eq!(config.vad.speech_pad, Duration::from_millis(40));
         assert_eq!(config.channel_capacity, 8);
+        assert_eq!(config.max_sources, 4);
     }
 
     #[test]

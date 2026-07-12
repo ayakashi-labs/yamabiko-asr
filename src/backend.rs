@@ -1,14 +1,10 @@
-use crate::tdt::ParakeetTdtModel;
+use crate::tdt::ParakeetTdtModel as LoadedParakeetTdtModel;
 use crate::vad::SpeechChunk;
 use crate::{Error, Language, Result, TranscriberConfig};
 
-pub(crate) trait AsrBackend: Send {
-    fn accept_speech(
-        &mut self,
-        speech: &SpeechChunk,
-        language: &Language,
-    ) -> Result<Vec<BackendTranscript>>;
-    fn flush(&mut self, next_input_sample: u64) -> Result<Vec<BackendTranscript>>;
+/// A loaded, heavyweight ASR model shared by recognition streams.
+pub(crate) trait AsrModel: Send {
+    fn transcribe(&mut self, samples: Vec<f32>, language: &Language) -> Result<String>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,26 +15,37 @@ pub(crate) struct BackendTranscript {
     pub is_final: bool,
 }
 
-pub(crate) struct ParakeetTdtBackend {
-    model: ParakeetTdtModel,
+/// The loaded Parakeet model. This owns the expensive ONNX sessions.
+pub(crate) struct ParakeetTdtModel {
+    inner: LoadedParakeetTdtModel,
+}
+
+impl ParakeetTdtModel {
+    pub(crate) fn load(config: &TranscriberConfig) -> Result<Self> {
+        validate_tdt_language(&config.language)?;
+        Ok(Self {
+            inner: LoadedParakeetTdtModel::load(&config.model_dir, config.device)?,
+        })
+    }
+}
+
+impl AsrModel for ParakeetTdtModel {
+    fn transcribe(&mut self, samples: Vec<f32>, _language: &Language) -> Result<String> {
+        self.inner
+            .transcribe_samples(samples)
+            .map_err(|err| Error::Backend(err.to_string()))
+    }
+}
+
+/// Lightweight buffering and decoder input state for one audio source.
+#[derive(Default)]
+pub(crate) struct RecognitionStream {
     pending_samples: Vec<f32>,
     pending_start_sample: Option<u64>,
     pending_end_sample: u64,
 }
 
-impl ParakeetTdtBackend {
-    pub(crate) fn load(config: &TranscriberConfig) -> Result<Self> {
-        validate_tdt_language(&config.language)?;
-        let model = ParakeetTdtModel::load(&config.model_dir, config.device)?;
-
-        Ok(Self {
-            model,
-            pending_samples: Vec::new(),
-            pending_start_sample: None,
-            pending_end_sample: 0,
-        })
-    }
-
+impl RecognitionStream {
     fn push_samples(&mut self, speech: &SpeechChunk) {
         if !speech.samples.is_empty() {
             if self.pending_start_sample.is_none() {
@@ -52,7 +59,12 @@ impl ParakeetTdtBackend {
         }
     }
 
-    fn transcribe_pending(&mut self, default_end_sample: u64) -> Result<Vec<BackendTranscript>> {
+    fn transcribe_pending(
+        &mut self,
+        model: &mut dyn AsrModel,
+        language: &Language,
+        default_end_sample: u64,
+    ) -> Result<Vec<BackendTranscript>> {
         let Some(start_sample) = self.pending_start_sample.take() else {
             return Ok(Vec::new());
         };
@@ -64,11 +76,7 @@ impl ParakeetTdtBackend {
         let end_sample = self.pending_end_sample.max(default_end_sample);
         let samples = std::mem::take(&mut self.pending_samples);
         self.pending_end_sample = 0;
-
-        let result = self
-            .model
-            .transcribe_samples(samples)
-            .map_err(|err| Error::Backend(err.to_string()))?;
+        let result = model.transcribe(samples, language)?;
 
         if result.trim().is_empty() {
             return Ok(Vec::new());
@@ -81,24 +89,28 @@ impl ParakeetTdtBackend {
             is_final: true,
         }])
     }
-}
 
-impl AsrBackend for ParakeetTdtBackend {
-    fn accept_speech(
+    pub(crate) fn accept_speech(
         &mut self,
+        model: &mut dyn AsrModel,
         speech: &SpeechChunk,
-        _language: &Language,
+        language: &Language,
     ) -> Result<Vec<BackendTranscript>> {
         self.push_samples(speech);
         if speech.is_final {
-            self.transcribe_pending(speech.end_sample)
+            self.transcribe_pending(model, language, speech.end_sample)
         } else {
             Ok(Vec::new())
         }
     }
 
-    fn flush(&mut self, next_input_sample: u64) -> Result<Vec<BackendTranscript>> {
-        self.transcribe_pending(next_input_sample)
+    pub(crate) fn flush(
+        &mut self,
+        model: &mut dyn AsrModel,
+        language: &Language,
+        next_input_sample: u64,
+    ) -> Result<Vec<BackendTranscript>> {
+        self.transcribe_pending(model, language, next_input_sample)
     }
 }
 

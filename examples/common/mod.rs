@@ -123,6 +123,7 @@ pub fn print_segment(event: TranscriptEvent) -> bool {
             true
         }
         TranscriptEvent::EndOfStream => false,
+        _ => true,
     }
 }
 

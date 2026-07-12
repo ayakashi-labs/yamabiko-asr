@@ -1,10 +1,11 @@
-use crate::{Device, PcmFormat};
+use crate::{AudioSourceId, Device, PcmFormat};
 use std::fmt;
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors exposed to applications using the Parakeet transcription pipeline.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
     /// Input PCM did not match the required v0.1 format.
@@ -24,10 +25,12 @@ pub enum Error {
     Vad(String),
     /// ASR inference failed after model load.
     Backend(String),
-    /// The input or output stream was closed before processing completed.
+    /// The session cannot accept another concurrently active source.
+    SourceLimit { max_sources: usize },
+    /// A command referenced a source that is no longer active.
+    SourceNotFound { source_id: AudioSourceId },
+    /// The transcription worker is no longer accepting commands.
     StreamClosed,
-    /// The blocking transcription worker failed to join.
-    Join(String),
 }
 
 impl fmt::Display for Error {
@@ -45,8 +48,13 @@ impl fmt::Display for Error {
             Self::ModelLoad(message) => write!(f, "failed to load ASR model: {message}"),
             Self::Vad(message) => write!(f, "VAD failed: {message}"),
             Self::Backend(message) => write!(f, "ASR backend failed: {message}"),
+            Self::SourceLimit { max_sources } => {
+                write!(f, "audio source limit reached: max_sources={max_sources}")
+            }
+            Self::SourceNotFound { source_id } => {
+                write!(f, "audio source {} is not active", source_id.get())
+            }
             Self::StreamClosed => write!(f, "transcription stream closed"),
-            Self::Join(message) => write!(f, "transcription worker failed: {message}"),
         }
     }
 }
