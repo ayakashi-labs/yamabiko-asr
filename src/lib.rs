@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamps_use_input_audio_timeline() {
+    async fn timestamps_use_session_audio_timeline() {
         let model = FakeModel {
             calls: Arc::new(Mutex::new(Vec::new())),
             next: 0,
@@ -356,7 +356,7 @@ mod tests {
             .await
             .unwrap();
         system_input
-            .send(PcmChunk::new(vec![0.2; 8]))
+            .send_at(Duration::from_millis(350), PcmChunk::new(vec![0.2; 8]))
             .await
             .unwrap();
         system_input.close().await.unwrap();
@@ -366,21 +366,131 @@ mod tests {
         let second = session.events.recv().await.unwrap().unwrap();
         let third = session.events.recv().await.unwrap().unwrap();
 
-        assert!(matches!(
-            first,
-            TranscriptEvent::Segment(TranscriptSegment {
-                id,
-                source_id: AudioSourceId::PRIMARY,
-                ..
-            }) if id.get() == 0
-        ));
-        assert!(matches!(
-            second,
-            TranscriptEvent::Segment(TranscriptSegment { id, source_id, .. })
-                if id.get() == 1 && source_id == system_source
-        ));
+        let TranscriptEvent::Segment(first) = first else {
+            panic!("expected primary segment");
+        };
+        let TranscriptEvent::Segment(second) = second else {
+            panic!("expected system segment");
+        };
+        assert_eq!(first.id.get(), 0);
+        assert_eq!(first.source_id, AudioSourceId::PRIMARY);
+        assert_eq!(first.start, Duration::ZERO);
+        assert_eq!(second.id.get(), 1);
+        assert_eq!(second.source_id, system_source);
+        assert_eq!(second.start, Duration::from_millis(350));
         assert!(matches!(third, TranscriptEvent::EndOfStream));
         assert_eq!(*calls.lock().unwrap(), vec![4, 8]);
+    }
+
+    #[tokio::test]
+    async fn discontinuous_explicit_timestamp_is_terminal_error() {
+        let transcriber = Transcriber::from_parts(
+            test_config(),
+            Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            Box::new(FakeVad {
+                chunks: vec![Vec::new(), Vec::new()],
+            }),
+        )
+        .unwrap();
+        let mut session = transcriber.start();
+
+        session
+            .input
+            .send_at(Duration::from_millis(100), PcmChunk::new(vec![0.0; 160]))
+            .await
+            .unwrap();
+        session
+            .input
+            .send_at(Duration::from_millis(105), PcmChunk::new(vec![0.0; 160]))
+            .await
+            .unwrap();
+
+        let error = session.events.recv().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::TimestampDiscontinuity {
+                source_id: AudioSourceId::PRIMARY,
+                expected,
+                actual,
+            } if expected == Duration::from_millis(110)
+                && actual == Duration::from_millis(105)
+        ));
+    }
+
+    #[tokio::test]
+    async fn anchored_source_continues_on_session_timeline_with_plain_send() {
+        let transcriber = Transcriber::from_parts(
+            test_config(),
+            Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            Box::new(FakeVad {
+                chunks: vec![
+                    Vec::new(),
+                    vec![vad::SpeechChunk {
+                        samples: vec![0.2; 160],
+                        start_sample: 160,
+                        end_sample: 320,
+                        is_final: true,
+                    }],
+                ],
+            }),
+        )
+        .unwrap();
+        let mut session = transcriber.start();
+
+        session
+            .input
+            .send_at(Duration::from_millis(100), PcmChunk::new(vec![0.0; 160]))
+            .await
+            .unwrap();
+        session
+            .input
+            .send(PcmChunk::new(vec![0.2; 160]))
+            .await
+            .unwrap();
+
+        let event = session.events.recv().await.unwrap().unwrap();
+        let TranscriptEvent::Segment(segment) = event else {
+            panic!("expected anchored segment");
+        };
+        assert_eq!(segment.start, Duration::from_millis(110));
+        assert_eq!(segment.end, Duration::from_millis(120));
+        session.input.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timestamp_must_align_to_pcm_sample_boundary() {
+        let transcriber = Transcriber::from_parts(
+            test_config(),
+            Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            Box::new(FakeVad { chunks: Vec::new() }),
+        )
+        .unwrap();
+        let mut session = transcriber.start();
+
+        session
+            .input
+            .send_at(Duration::from_nanos(1), PcmChunk::new(vec![0.0; 1]))
+            .await
+            .unwrap();
+
+        let error = session.events.recv().await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidTimestamp {
+                source_id: AudioSourceId::PRIMARY,
+                timestamp,
+                ..
+            } if timestamp == Duration::from_nanos(1)
+        ));
     }
 
     #[tokio::test]

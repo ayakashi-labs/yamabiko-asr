@@ -59,7 +59,7 @@ impl TranscriptEvent {
     }
 }
 
-/// One transcription segment on its source-local audio timeline.
+/// One transcription segment on the shared session audio timeline.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptSegment {
@@ -78,12 +78,12 @@ pub struct TranscriptSegment {
 }
 
 impl TranscriptSegment {
-    /// Segment start timestamp in milliseconds on the input audio timeline.
+    /// Segment start timestamp in milliseconds on the session timeline.
     pub fn start_ms(&self) -> u64 {
         duration_ms(self.start)
     }
 
-    /// Segment end timestamp in milliseconds on the input audio timeline.
+    /// Segment end timestamp in milliseconds on the session timeline.
     pub fn end_ms(&self) -> u64 {
         duration_ms(self.end)
     }

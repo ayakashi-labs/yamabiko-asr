@@ -1,5 +1,6 @@
 use crate::{AudioSourceId, Device, PcmFormat};
 use std::fmt;
+use std::time::Duration;
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -29,6 +30,18 @@ pub enum Error {
     SourceLimit { max_sources: usize },
     /// A command referenced a source that is no longer active.
     SourceNotFound { source_id: AudioSourceId },
+    /// A session timestamp could not be represented on the 16 kHz timeline.
+    InvalidTimestamp {
+        source_id: AudioSourceId,
+        timestamp: Duration,
+        message: String,
+    },
+    /// An explicit chunk timestamp did not continue the source timeline.
+    TimestampDiscontinuity {
+        source_id: AudioSourceId,
+        expected: Duration,
+        actual: Duration,
+    },
     /// The transcription worker is no longer accepting commands.
     StreamClosed,
 }
@@ -54,6 +67,24 @@ impl fmt::Display for Error {
             Self::SourceNotFound { source_id } => {
                 write!(f, "audio source {} is not active", source_id.get())
             }
+            Self::InvalidTimestamp {
+                source_id,
+                timestamp,
+                message,
+            } => write!(
+                f,
+                "invalid timestamp {timestamp:?} for audio source {}: {message}",
+                source_id.get()
+            ),
+            Self::TimestampDiscontinuity {
+                source_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "timestamp discontinuity for audio source {}: expected {expected:?}, got {actual:?}",
+                source_id.get()
+            ),
             Self::StreamClosed => write!(f, "transcription stream closed"),
         }
     }
