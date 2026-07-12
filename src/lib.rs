@@ -464,33 +464,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamp_must_align_to_pcm_sample_boundary() {
+    async fn timestamp_is_quantized_to_pcm_sample_boundary() {
         let transcriber = Transcriber::from_parts(
             test_config(),
             Box::new(FakeModel {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 next: 0,
             }),
-            Box::new(FakeVad { chunks: Vec::new() }),
+            Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.2; 1],
+                    start_sample: 0,
+                    end_sample: 1,
+                    is_final: true,
+                }]],
+            }),
         )
         .unwrap();
         let mut session = transcriber.start();
 
         session
             .input
-            .send_at(Duration::from_nanos(1), PcmChunk::new(vec![0.0; 1]))
+            .send_at(Duration::from_nanos(62_501), PcmChunk::new(vec![0.2; 1]))
             .await
             .unwrap();
 
-        let error = session.events.recv().await.unwrap().unwrap_err();
-        assert!(matches!(
-            error,
-            Error::InvalidTimestamp {
-                source_id: AudioSourceId::PRIMARY,
-                timestamp,
-                ..
-            } if timestamp == Duration::from_nanos(1)
-        ));
+        let event = session.events.recv().await.unwrap().unwrap();
+        let TranscriptEvent::Segment(segment) = event else {
+            panic!("expected quantized segment");
+        };
+        assert_eq!(segment.start, Duration::from_nanos(62_500));
     }
 
     #[tokio::test]

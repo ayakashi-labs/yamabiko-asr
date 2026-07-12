@@ -48,9 +48,10 @@ impl AudioInput {
 
     /// Send a chunk anchored to an absolute position on the session timeline.
     ///
-    /// The timestamp must fall exactly on a 16 kHz sample boundary. The first
-    /// explicit timestamp anchors this source; later explicit timestamps must
-    /// equal the position implied by all previously sent samples.
+    /// The timestamp is rounded down to the nearest 16 kHz sample boundary.
+    /// The first explicit timestamp anchors this source; later explicit
+    /// timestamps must equal the position implied by all previously sent
+    /// samples after the same quantization.
     /// Timestamp validation failures are emitted as terminal errors through
     /// `TranscriptionSession::events` after this command is accepted.
     pub async fn send_at(&self, timestamp: Duration, chunk: PcmChunk) -> Result<()> {
@@ -392,14 +393,6 @@ fn resolve_timeline_offset(
 
 fn session_sample_from_duration(source_id: AudioSourceId, timestamp: Duration) -> Result<u64> {
     let scaled = timestamp.as_nanos() * PCM_SAMPLE_RATE_HZ as u128;
-    if !scaled.is_multiple_of(1_000_000_000) {
-        return Err(Error::InvalidTimestamp {
-            source_id,
-            timestamp,
-            message: "timestamp must fall on a 16 kHz sample boundary".to_string(),
-        });
-    }
-
     u64::try_from(scaled / 1_000_000_000).map_err(|_| Error::InvalidTimestamp {
         source_id,
         timestamp,
