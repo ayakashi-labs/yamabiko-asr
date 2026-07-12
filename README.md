@@ -162,7 +162,9 @@ cargo run --example microphone_and_system_audio -- .\models\parakeet-tdt_ctc-0.6
 ```
 
 Its output is labeled `[microphone]` or `[system]` using each segment's source
-identifier. Both capture devices must expose an f32 default format.
+identifier. Both capture devices must expose an f32 default format. Clock-drift
+correction between independently clocked capture devices is planned for
+long-running sessions.
 
 For the Japanese Parakeet TDT model, export ONNX files first:
 
