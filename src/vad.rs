@@ -14,6 +14,26 @@ pub(crate) trait VadGate: Send {
     fn finish(&mut self) -> Result<Vec<SpeechChunk>>;
 }
 
+pub(crate) trait VadFactory: Send {
+    fn create(&mut self) -> Result<Box<dyn VadGate>>;
+}
+
+pub(crate) struct SileroVadFactory {
+    config: VadConfig,
+}
+
+impl SileroVadFactory {
+    pub(crate) fn new(config: VadConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl VadFactory for SileroVadFactory {
+    fn create(&mut self) -> Result<Box<dyn VadGate>> {
+        Ok(Box::new(SileroVadGate::new(self.config.clone())?))
+    }
+}
+
 pub(crate) struct SileroVadGate {
     session: Session,
     stream: StreamState,

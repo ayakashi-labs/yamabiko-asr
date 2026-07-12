@@ -20,6 +20,12 @@ yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
 ## Current Scope
 
 - Tokio-based streaming input/output API.
+- One loaded ASR model per transcriber. Multiple source streams share that
+  model while keeping source audio, VAD state, buffers, and timelines separate
+  rather than mixing inputs before transcription.
+- Additional sources are registered explicitly and limited by `max_sources`
+  (default: 2, including the primary input). Closing one source flushes and
+  releases only that source.
 - Input timestamps are preserved even when VAD removes silent audio before ASR.
 - Output events currently contain VAD-final utterance segments.
 - ASR execution device can be selected explicitly: `cpu`, `auto`,
@@ -42,16 +48,29 @@ use yamabiko_asr::{PcmChunk, TranscriptEvent, Transcriber};
 
 # async fn run() -> yamabiko_asr::Result<()> {
 let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
-let (input, mut events) = transcriber.start().into_channels();
+let (input, mut events, worker) = transcriber.start().into_parts();
 
-input.send(PcmChunk::new(vec![0.0; 1600])).await.unwrap();
-drop(input);
+let producer = tokio::spawn(async move {
+    input.send(PcmChunk::new(vec![0.0; 1600])).await?;
+    input.close().await
+});
 
 while let Some(event) = events.recv().await {
-    if let TranscriptEvent::Segment(segment) = event? {
-        println!("{}ms: {}", segment.start_ms(), segment.text);
+    match event? {
+        TranscriptEvent::Segment(segment) => {
+            println!("{}ms: {}", segment.start_ms(), segment.text);
+        }
+        TranscriptEvent::EndOfStream => break,
+        _ => {}
     }
 }
+
+producer
+    .await
+    .map_err(|_| yamabiko_asr::Error::StreamClosed)??;
+worker
+    .await
+    .map_err(|_| yamabiko_asr::Error::StreamClosed)?;
 # Ok(())
 # }
 ```
@@ -64,6 +83,49 @@ millisecond payload:
 # fn emit_to_ui(segment: &yamabiko_asr::TranscriptSegment) {
 let payload: TranscriptSegmentPayload = segment.to_payload();
 // app.emit("transcript-segment", payload)?;
+# }
+```
+
+Multiple capture streams can share the same loaded ASR model. Register each
+additional stream explicitly; closing one input flushes and releases only that
+source. Segment timestamps remain source-local and emitted segments carry the
+allocated source identifier. Each segment also has a stable `SegmentId`;
+consumers should upsert by that ID so later text or speaker revisions can
+replace an earlier version:
+
+```rust,no_run
+use yamabiko_asr::{AudioSourceConfig, PcmChunk, TranscriptEvent, Transcriber};
+
+# async fn send_audio(
+#     transcriber: Transcriber,
+# ) -> yamabiko_asr::Result<()> {
+let session = transcriber.start();
+let system_audio = session
+    .open_source(AudioSourceConfig::system_audio())
+    .await?;
+let (microphone, mut events, worker) = session.into_parts();
+
+let producer = tokio::spawn(async move {
+    microphone.send(PcmChunk::new(vec![0.0; 1600])).await?;
+    system_audio.send(PcmChunk::new(vec![0.0; 1600])).await?;
+
+    system_audio.close().await?;
+    microphone.close().await
+});
+
+while let Some(event) = events.recv().await {
+    if matches!(event?, TranscriptEvent::EndOfStream) {
+        break;
+    }
+}
+
+producer
+    .await
+    .map_err(|_| yamabiko_asr::Error::StreamClosed)??;
+worker
+    .await
+    .map_err(|_| yamabiko_asr::Error::StreamClosed)?;
+# Ok(())
 # }
 ```
 

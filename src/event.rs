@@ -1,6 +1,48 @@
+use crate::AudioSourceId;
 use std::time::Duration;
 
+/// Stable identifier for a transcript segment within one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SegmentId(u64);
+
+impl SegmentId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the numeric representation used in UI payloads.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Stable identifier for an anonymous or identified speaker.
+///
+/// Speaker assignment is optional until a diarization or identification
+/// stage associates a segment with a speaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SpeakerId(u64);
+
+impl SpeakerId {
+    /// Create an application- or diarizer-assigned speaker identifier.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the numeric representation used in UI payloads.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Events emitted by a running transcription session.
+///
+/// Consumers should treat `Segment` as an upsert keyed by `SegmentId` so a
+/// future diarization or streaming decoder can revise text, timing, or speaker
+/// assignment without introducing a second update mechanism.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEvent {
     Segment(TranscriptSegment),
@@ -17,10 +59,16 @@ impl TranscriptEvent {
     }
 }
 
-/// One transcription segment on the input audio timeline.
+/// One transcription segment on its source-local audio timeline.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptSegment {
+    /// Stable key for inserting or updating this segment.
+    pub id: SegmentId,
+    /// Audio source that produced this segment.
+    pub source_id: AudioSourceId,
+    /// Assigned speaker, when speaker processing is available.
+    pub speaker_id: Option<SpeakerId>,
     pub text: String,
     pub start: Duration,
     pub end: Duration,
@@ -95,6 +143,9 @@ impl From<TranscriptEvent> for TranscriptEventPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TranscriptSegmentPayload {
+    pub id: u64,
+    pub source_id: u64,
+    pub speaker_id: Option<u64>,
     pub text: String,
     pub start_ms: u64,
     pub end_ms: u64,
@@ -106,6 +157,9 @@ pub struct TranscriptSegmentPayload {
 impl From<&TranscriptSegment> for TranscriptSegmentPayload {
     fn from(segment: &TranscriptSegment) -> Self {
         Self {
+            id: segment.id.get(),
+            source_id: segment.source_id.get(),
+            speaker_id: segment.speaker_id.map(SpeakerId::get),
             text: segment.text.clone(),
             start_ms: segment.start_ms(),
             end_ms: segment.end_ms(),
@@ -119,6 +173,9 @@ impl From<&TranscriptSegment> for TranscriptSegmentPayload {
 impl From<TranscriptSegment> for TranscriptSegmentPayload {
     fn from(segment: TranscriptSegment) -> Self {
         Self {
+            id: segment.id.get(),
+            source_id: segment.source_id.get(),
+            speaker_id: segment.speaker_id.map(SpeakerId::get),
             start_ms: segment.start_ms(),
             end_ms: segment.end_ms(),
             duration_ms: segment.duration_ms(),
@@ -140,6 +197,9 @@ mod tests {
     #[test]
     fn segment_payload_uses_millisecond_timestamps() {
         let segment = TranscriptSegment {
+            id: SegmentId::new(42),
+            source_id: AudioSourceId::PRIMARY,
+            speaker_id: Some(SpeakerId::new(3)),
             text: "hello".to_string(),
             start: Duration::from_millis(1_234),
             end: Duration::from_millis(2_500),
@@ -149,6 +209,9 @@ mod tests {
 
         let payload = segment.to_payload();
 
+        assert_eq!(payload.id, 42);
+        assert_eq!(payload.source_id, AudioSourceId::PRIMARY.get());
+        assert_eq!(payload.speaker_id, Some(3));
         assert_eq!(payload.text, "hello");
         assert_eq!(payload.start_ms, 1_234);
         assert_eq!(payload.end_ms, 2_500);

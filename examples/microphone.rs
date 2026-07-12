@@ -34,6 +34,7 @@ async fn main() -> common::ExampleResult<()> {
     let language = match &config.language {
         Language::Auto => "auto".to_string(),
         Language::Hint(hint) => hint.clone(),
+        _ => "unknown".to_string(),
     };
 
     let stream_config: cpal::StreamConfig = supported.into();
@@ -104,6 +105,7 @@ async fn main() -> common::ExampleResult<()> {
         if !asr_buffer.is_empty() {
             let _ = input.blocking_send(PcmChunk::new(asr_buffer));
         }
+        let _ = input.blocking_close();
     });
 
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
