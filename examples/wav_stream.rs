@@ -20,6 +20,7 @@ async fn main() -> common::ExampleResult<()> {
                 .await
                 .map_err(|_| "transcription worker closed")?;
         }
+        input.close().await?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     });
 
