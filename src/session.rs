@@ -1,8 +1,8 @@
-use crate::backend::{AsrModel, BackendTranscript, RecognitionStream};
+use crate::PCM_SAMPLE_RATE_HZ;
+use crate::backend::AsrModel;
 use crate::event::{SegmentId, TranscriptEvent, TranscriptSegment};
 use crate::vad::{SpeechChunk, VadFactory, VadGate, duration_from_samples};
-use crate::{AudioSourceConfig, AudioSourceId, Error, PcmChunk, Result, TranscriberConfig};
-use std::collections::BTreeMap;
+use crate::{AudioSourceId, Error, Result};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -37,35 +37,70 @@ impl AudioInput {
         self.source_id
     }
 
-    /// Send one PCM chunk for this source.
-    pub async fn send(&self, chunk: PcmChunk) -> Result<()> {
+    /// Send one f32 mono 16 kHz PCM chunk for this source.
+    ///
+    /// The first un-timestamped chunk anchors the source at session time zero;
+    /// later chunks continue from the preceding sample count.
+    pub async fn send(&self, samples: Vec<f32>) -> Result<()> {
+        self.send_command(None, samples).await
+    }
+
+    /// Send an f32 mono 16 kHz chunk anchored to the session timeline.
+    ///
+    /// The timestamp is rounded down to the nearest 16 kHz sample boundary.
+    /// The first explicit timestamp anchors this source; later explicit
+    /// timestamps must equal the position implied by all previously sent
+    /// samples after the same quantization.
+    /// Timestamp validation failures are emitted as terminal errors through
+    /// `TranscriptionSession::events` after this command is accepted.
+    pub async fn send_at(&self, timestamp: Duration, samples: Vec<f32>) -> Result<()> {
+        self.send_command(Some(timestamp), samples).await
+    }
+
+    async fn send_command(&self, timestamp: Option<Duration>, samples: Vec<f32>) -> Result<()> {
         self.commands
             .send(SessionCommand::Audio {
                 source_id: self.source_id,
-                chunk,
+                timestamp,
+                samples,
             })
             .await
             .map_err(|_| Error::StreamClosed)
     }
 
-    /// Send one PCM chunk from a non-async capture thread.
+    /// Send one f32 mono 16 kHz PCM chunk from a non-async capture thread.
     ///
     /// # Panics
     ///
     /// Panics when called from an asynchronous execution context.
-    pub fn blocking_send(&self, chunk: PcmChunk) -> Result<()> {
+    pub fn blocking_send(&self, samples: Vec<f32>) -> Result<()> {
+        self.blocking_send_command(None, samples)
+    }
+
+    /// Send a timestamped chunk from a non-async capture thread.
+    ///
+    /// This has the same timeline requirements and terminal error reporting as
+    /// `send_at`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from an asynchronous execution context.
+    pub fn blocking_send_at(&self, timestamp: Duration, samples: Vec<f32>) -> Result<()> {
+        self.blocking_send_command(Some(timestamp), samples)
+    }
+
+    fn blocking_send_command(&self, timestamp: Option<Duration>, samples: Vec<f32>) -> Result<()> {
         self.commands
             .blocking_send(SessionCommand::Audio {
                 source_id: self.source_id,
-                chunk,
+                timestamp,
+                samples,
             })
             .map_err(|_| Error::StreamClosed)
     }
 
     /// Finish and release this source after emitting any buffered segment.
     ///
-    /// Transcript events must be drained concurrently because closing may
-    /// emit a final segment through the bounded event channel.
     pub async fn close(mut self) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
@@ -80,8 +115,6 @@ impl AudioInput {
     }
 
     /// Finish and release this source from a non-async capture thread.
-    ///
-    /// Transcript events must be drained concurrently while this waits.
     ///
     /// # Panics
     ///
@@ -118,7 +151,7 @@ pub struct TranscriptionSession {
     ///
     /// After an error, the worker closes the event channel without emitting
     /// `TranscriptEvent::EndOfStream`.
-    pub events: mpsc::Receiver<Result<TranscriptEvent>>,
+    pub events: mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
     pub(crate) commands: mpsc::Sender<SessionCommand>,
     pub(crate) worker: TranscriptionWorker,
 }
@@ -128,24 +161,14 @@ impl TranscriptionSession {
     ///
     /// This waits for the source's VAD session to initialize. Closing a source
     /// releases its state and makes its capacity available to another source.
-    pub async fn open_source(&self, config: AudioSourceConfig) -> Result<AudioInput> {
+    pub async fn open_source(&self) -> Result<AudioInput> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
-            .send(SessionCommand::OpenSource {
-                config,
-                reply: reply_tx,
-            })
+            .send(SessionCommand::OpenSource { reply: reply_tx })
             .await
             .map_err(|_| Error::StreamClosed)?;
         let source_id = reply_rx.await.map_err(|_| Error::StreamClosed)??;
         Ok(AudioInput::new(source_id, self.commands.clone()))
-    }
-
-    /// Split the session into its primary input and output channel.
-    ///
-    /// Call `AudioInput::close` to flush the source and end the session.
-    pub fn into_channels(self) -> (AudioInput, mpsc::Receiver<Result<TranscriptEvent>>) {
-        (self.input, self.events)
     }
 
     /// Split the session into primary input, output, and worker handle.
@@ -153,7 +176,7 @@ impl TranscriptionSession {
         self,
     ) -> (
         AudioInput,
-        mpsc::Receiver<Result<TranscriptEvent>>,
+        mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
         TranscriptionWorker,
     ) {
         (self.input, self.events, self.worker)
@@ -162,12 +185,12 @@ impl TranscriptionSession {
 
 pub(crate) enum SessionCommand {
     OpenSource {
-        config: AudioSourceConfig,
         reply: oneshot::Sender<Result<AudioSourceId>>,
     },
     Audio {
         source_id: AudioSourceId,
-        chunk: PcmChunk,
+        timestamp: Option<Duration>,
+        samples: Vec<f32>,
     },
     CloseSource {
         source_id: AudioSourceId,
@@ -176,36 +199,29 @@ pub(crate) enum SessionCommand {
 }
 
 pub(crate) fn run_transcription_worker(
-    config: TranscriberConfig,
+    max_sources: usize,
     mut model: Box<dyn AsrModel>,
-    primary_stream: RecognitionStream,
     primary_vad: Box<dyn VadGate>,
     mut vad_factory: Box<dyn VadFactory>,
     mut command_rx: mpsc::Receiver<SessionCommand>,
-    event_tx: mpsc::Sender<Result<TranscriptEvent>>,
+    event_tx: mpsc::UnboundedSender<Result<TranscriptEvent>>,
 ) {
     let mut next_segment_id = 0u64;
     let mut next_source_id = 1u64;
-    let mut sources = BTreeMap::from([(
+    let mut sources = vec![(
         AudioSourceId::PRIMARY,
         SourceState {
-            _config: AudioSourceConfig::other(),
-            stream: primary_stream,
             vad: primary_vad,
             next_input_sample: 0,
+            timeline_offset_sample: None,
         },
-    )]);
+    )];
 
     while let Some(command) = command_rx.blocking_recv() {
         match command {
-            SessionCommand::OpenSource {
-                config: source_config,
-                reply,
-            } => {
-                if sources.len() >= config.max_sources {
-                    let _ = reply.send(Err(Error::SourceLimit {
-                        max_sources: config.max_sources,
-                    }));
+            SessionCommand::OpenSource { reply } => {
+                if sources.len() >= max_sources {
+                    let _ = reply.send(Err(Error::SourceLimit { max_sources }));
                     continue;
                 }
 
@@ -229,50 +245,58 @@ pub(crate) fn run_transcription_worker(
                 if reply.send(Ok(source_id)).is_err() {
                     continue;
                 }
-                sources.insert(
+                sources.push((
                     source_id,
                     SourceState {
-                        _config: source_config,
-                        stream: RecognitionStream::default(),
                         vad,
                         next_input_sample: 0,
+                        timeline_offset_sample: None,
                     },
-                );
+                ));
             }
-            SessionCommand::Audio { source_id, chunk } => {
-                let Some(source) = sources.get_mut(&source_id) else {
+            SessionCommand::Audio {
+                source_id,
+                timestamp,
+                samples,
+            } => {
+                let Some(source) = sources
+                    .iter_mut()
+                    .find(|(id, _)| *id == source_id)
+                    .map(|(_, source)| source)
+                else {
                     fail(&event_tx, Error::SourceNotFound { source_id });
                     return;
                 };
+                let mut sink = EventSink {
+                    event_tx: &event_tx,
+                    next_segment_id: &mut next_segment_id,
+                };
                 if let Err(err) = process_chunk(
-                    &config,
                     model.as_mut(),
                     source,
-                    &event_tx,
-                    &mut next_segment_id,
+                    &mut sink,
                     source_id,
-                    chunk,
+                    timestamp,
+                    samples,
                 ) {
                     fail(&event_tx, err);
                     return;
                 }
             }
             SessionCommand::CloseSource { source_id, reply } => {
-                let Some(source) = sources.remove(&source_id) else {
+                let Some(position) = sources.iter().position(|(id, _)| *id == source_id) else {
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(Error::SourceNotFound { source_id }));
                     }
                     continue;
                 };
+                let (_, source) = sources.remove(position);
 
-                let result = finish_source(
-                    &config,
-                    model.as_mut(),
-                    source,
-                    &event_tx,
-                    &mut next_segment_id,
-                    source_id,
-                );
+                let mut sink = EventSink {
+                    event_tx: &event_tx,
+                    next_segment_id: &mut next_segment_id,
+                };
+                let result = finish_source(model.as_mut(), source, &mut sink, source_id);
                 if let Some(reply) = reply {
                     let _ = reply.send(result.clone());
                 }
@@ -289,14 +313,11 @@ pub(crate) fn run_transcription_worker(
     }
 
     for (source_id, source) in sources {
-        if let Err(err) = finish_source(
-            &config,
-            model.as_mut(),
-            source,
-            &event_tx,
-            &mut next_segment_id,
-            source_id,
-        ) {
+        let mut sink = EventSink {
+            event_tx: &event_tx,
+            next_segment_id: &mut next_segment_id,
+        };
+        if let Err(err) = finish_source(model.as_mut(), source, &mut sink, source_id) {
             fail(&event_tx, err);
             return;
         }
@@ -305,133 +326,165 @@ pub(crate) fn run_transcription_worker(
 }
 
 struct SourceState {
-    _config: AudioSourceConfig,
-    stream: RecognitionStream,
     vad: Box<dyn VadGate>,
     next_input_sample: u64,
+    timeline_offset_sample: Option<u64>,
+}
+
+struct EventSink<'a> {
+    event_tx: &'a mpsc::UnboundedSender<Result<TranscriptEvent>>,
+    next_segment_id: &'a mut u64,
+}
+
+fn resolve_timeline_offset(
+    source_id: AudioSourceId,
+    source: &mut SourceState,
+    timestamp: Option<Duration>,
+) -> Result<u64> {
+    let explicit_sample = timestamp
+        .map(|timestamp| session_sample_from_duration(source_id, timestamp))
+        .transpose()?;
+
+    match source.timeline_offset_sample {
+        Some(offset) => {
+            if let Some(actual_sample) = explicit_sample {
+                let expected_sample = timeline_sample(source_id, offset, source.next_input_sample)?;
+                if actual_sample != expected_sample {
+                    return Err(Error::TimestampDiscontinuity {
+                        source_id,
+                        expected: duration_from_samples(expected_sample),
+                        actual: timestamp.expect("explicit sample requires a timestamp"),
+                    });
+                }
+            }
+            Ok(offset)
+        }
+        None => {
+            let offset = explicit_sample.unwrap_or(0);
+            source.timeline_offset_sample = Some(offset);
+            Ok(offset)
+        }
+    }
+}
+
+fn session_sample_from_duration(source_id: AudioSourceId, timestamp: Duration) -> Result<u64> {
+    let scaled = timestamp.as_nanos() * PCM_SAMPLE_RATE_HZ as u128;
+    u64::try_from(scaled / 1_000_000_000).map_err(|_| Error::InvalidTimestamp {
+        source_id,
+        timestamp,
+        message: "timestamp exceeds the supported session timeline".to_string(),
+    })
+}
+
+fn timeline_sample(source_id: AudioSourceId, offset: u64, sample: u64) -> Result<u64> {
+    offset
+        .checked_add(sample)
+        .ok_or_else(|| Error::InvalidTimestamp {
+            source_id,
+            timestamp: duration_from_samples(offset),
+            message: "timestamp plus source audio length overflows the session timeline"
+                .to_string(),
+        })
 }
 
 fn process_chunk(
-    config: &TranscriberConfig,
     model: &mut dyn AsrModel,
     source: &mut SourceState,
-    event_tx: &mpsc::Sender<Result<TranscriptEvent>>,
-    next_segment_id: &mut u64,
+    sink: &mut EventSink<'_>,
     source_id: AudioSourceId,
-    chunk: PcmChunk,
+    timestamp: Option<Duration>,
+    samples: Vec<f32>,
 ) -> Result<()> {
-    chunk.format.validate()?;
+    let timeline_offset_sample = resolve_timeline_offset(source_id, source, timestamp)?;
     let start_sample = source.next_input_sample;
     source.next_input_sample = source
         .next_input_sample
-        .saturating_add(chunk.samples.len() as u64);
-    let speech_chunks = source.vad.push(&chunk, start_sample)?;
+        .saturating_add(samples.len() as u64);
+    let speech_chunks = source.vad.push(&samples, start_sample)?;
     handle_speech_chunks(
-        config,
         model,
-        &mut source.stream,
-        event_tx,
-        next_segment_id,
+        sink,
         source_id,
+        timeline_offset_sample,
         speech_chunks,
     )
 }
 
 fn finish_source(
-    config: &TranscriberConfig,
     model: &mut dyn AsrModel,
     mut source: SourceState,
-    event_tx: &mpsc::Sender<Result<TranscriptEvent>>,
-    next_segment_id: &mut u64,
+    sink: &mut EventSink<'_>,
     source_id: AudioSourceId,
 ) -> Result<()> {
     let final_chunks = source.vad.finish()?;
-    handle_speech_chunks(
-        config,
-        model,
-        &mut source.stream,
-        event_tx,
-        next_segment_id,
-        source_id,
-        final_chunks,
-    )?;
-
-    let started = Instant::now();
-    let transcripts = source
-        .stream
-        .flush(model, &config.language, source.next_input_sample)?;
-    send_transcripts(
-        event_tx,
-        next_segment_id,
-        source_id,
-        transcripts,
-        started.elapsed(),
-    )
+    let timeline_offset_sample = source.timeline_offset_sample.unwrap_or(0);
+    handle_speech_chunks(model, sink, source_id, timeline_offset_sample, final_chunks)
 }
 
 fn handle_speech_chunks(
-    config: &TranscriberConfig,
     model: &mut dyn AsrModel,
-    stream: &mut RecognitionStream,
-    event_tx: &mpsc::Sender<Result<TranscriptEvent>>,
-    next_segment_id: &mut u64,
+    sink: &mut EventSink<'_>,
     source_id: AudioSourceId,
+    timeline_offset_sample: u64,
     chunks: Vec<SpeechChunk>,
 ) -> Result<()> {
     for speech in chunks {
+        if speech.samples.is_empty() {
+            continue;
+        }
         let started = Instant::now();
-        let transcripts = stream.accept_speech(model, &speech, &config.language)?;
-        send_transcripts(
-            event_tx,
-            next_segment_id,
+        let text = model.transcribe(speech.samples)?;
+        if text.trim().is_empty() {
+            continue;
+        }
+        send_transcript(
+            sink,
             source_id,
-            transcripts,
+            timeline_offset_sample,
+            speech.start_sample,
+            speech.end_sample,
+            text,
             started.elapsed(),
         )?;
     }
     Ok(())
 }
 
-fn send_transcripts(
-    event_tx: &mpsc::Sender<Result<TranscriptEvent>>,
-    next_segment_id: &mut u64,
+fn send_transcript(
+    sink: &mut EventSink<'_>,
     source_id: AudioSourceId,
-    transcripts: Vec<BackendTranscript>,
+    timeline_offset_sample: u64,
+    transcript_start_sample: u64,
+    transcript_end_sample: u64,
+    text: String,
     inference_duration: Duration,
 ) -> Result<()> {
-    for transcript in transcripts {
-        if transcript.text.trim().is_empty() {
-            continue;
-        }
-
-        let id = SegmentId::new(*next_segment_id);
-        *next_segment_id = next_segment_id.saturating_add(1);
-        send_event(
-            event_tx,
-            Ok(TranscriptEvent::Segment(TranscriptSegment {
-                id,
-                source_id,
-                speaker_id: None,
-                text: transcript.text,
-                start: duration_from_samples(transcript.start_sample),
-                end: duration_from_samples(transcript.end_sample),
-                inference_duration,
-                is_final: transcript.is_final,
-            })),
-        )?;
-    }
-    Ok(())
+    let id = SegmentId::new(*sink.next_segment_id);
+    *sink.next_segment_id = sink.next_segment_id.saturating_add(1);
+    let start_sample = timeline_sample(source_id, timeline_offset_sample, transcript_start_sample)?;
+    let end_sample = timeline_sample(source_id, timeline_offset_sample, transcript_end_sample)?;
+    send_event(
+        sink.event_tx,
+        Ok(TranscriptEvent::Segment(TranscriptSegment {
+            id,
+            source_id,
+            speaker_id: None,
+            text,
+            start: duration_from_samples(start_sample),
+            end: duration_from_samples(end_sample),
+            inference_duration,
+            is_final: true,
+        })),
+    )
 }
 
 fn send_event(
-    event_tx: &mpsc::Sender<Result<TranscriptEvent>>,
+    event_tx: &mpsc::UnboundedSender<Result<TranscriptEvent>>,
     event: Result<TranscriptEvent>,
 ) -> Result<()> {
-    event_tx
-        .blocking_send(event)
-        .map_err(|_| Error::StreamClosed)
+    event_tx.send(event).map_err(|_| Error::StreamClosed)
 }
 
-fn fail(event_tx: &mpsc::Sender<Result<TranscriptEvent>>, err: Error) {
+fn fail(event_tx: &mpsc::UnboundedSender<Result<TranscriptEvent>>, err: Error) {
     let _ = send_event(event_tx, Err(err));
 }

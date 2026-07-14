@@ -1,8 +1,8 @@
 use crate::{Device, Error, PCM_SAMPLE_RATE_HZ, Result};
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array2, Array3, Axis};
 use ort::ep::ExecutionProviderDispatch;
 use ort::session::{Session, builder::GraphOptimizationLevel};
-use ort::value::ValueType;
+use ort::value::{TensorRef, ValueType};
 use realfft::RealToComplex;
 use std::f32::consts::PI;
 use std::fs::File;
@@ -22,6 +22,7 @@ pub(crate) struct ParakeetTdtModel {
     vocab: Vec<String>,
     mel_basis: Array2<f32>,
     fft_plan: Arc<dyn RealToComplex<f32>>,
+    window: Vec<f32>,
     word_boundary: WordBoundary,
 }
 
@@ -48,6 +49,7 @@ impl ParakeetTdtModel {
         let mel_basis = create_mel_filterbank(N_FFT, feature_size, PCM_SAMPLE_RATE_HZ as usize);
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_plan = planner.plan_fft_forward(N_FFT);
+        let window = hann_window(WIN_LENGTH);
 
         Ok(Self {
             encoder,
@@ -55,41 +57,40 @@ impl ParakeetTdtModel {
             vocab,
             mel_basis,
             fft_plan,
+            window,
             word_boundary,
         })
     }
 
-    pub(crate) fn transcribe_samples(&mut self, samples: Vec<f32>) -> Result<String> {
-        let features = self.extract_features(samples)?;
-        let (encoder_out, encoder_len) = self.run_encoder(&features)?;
-        let tokens = self.greedy_decode(&encoder_out, encoder_len)?;
+    pub(crate) fn transcribe_samples(&mut self, mut samples: Vec<f32>) -> Result<String> {
+        apply_preemphasis_in_place(&mut samples, PREEMPHASIS);
+        let features = self.extract_features(&samples)?;
+        let tokens = self.run_encoder_and_decode(&features)?;
         Ok(self.decode_tokens(&tokens))
     }
 
-    fn extract_features(&self, mut audio: Vec<f32>) -> Result<Array2<f32>> {
-        audio = apply_preemphasis(&audio, PREEMPHASIS);
-        let spectrogram = stft_with_plan(&audio, &self.fft_plan, N_FFT, HOP_LENGTH, WIN_LENGTH)?;
-        let mel_spectrogram = self.mel_basis.dot(&spectrogram);
+    fn extract_features(&self, audio: &[f32]) -> Result<Array2<f32>> {
+        let spectrogram = stft_with_plan(audio, &self.fft_plan, &self.window, N_FFT, HOP_LENGTH)?;
+        let mut mel_spectrogram = self.mel_basis.dot(&spectrogram);
         let log_zero_guard = 2.0f32.powi(-24);
-        let mel_spectrogram = mel_spectrogram.mapv(|value| (value + log_zero_guard).ln());
-        let mut mel_spectrogram = mel_spectrogram.t().to_owned();
+        mel_spectrogram.mapv_inplace(|value| (value + log_zero_guard).ln());
 
-        let num_frames = mel_spectrogram.shape()[0];
-        let num_features = mel_spectrogram.shape()[1];
+        let num_features = mel_spectrogram.shape()[0];
+        let num_frames = mel_spectrogram.shape()[1];
         if num_frames <= 1 {
             return Ok(mel_spectrogram);
         }
 
         for feat_idx in 0..num_features {
-            let mut column = mel_spectrogram.column_mut(feat_idx);
-            let mean = column.iter().sum::<f32>() / num_frames as f32;
-            let variance = column
+            let mut feature = mel_spectrogram.row_mut(feat_idx);
+            let mean = feature.iter().sum::<f32>() / num_frames as f32;
+            let variance = feature
                 .iter()
                 .map(|&value| (value - mean).powi(2))
                 .sum::<f32>()
                 / (num_frames as f32 - 1.0);
             let std = variance.sqrt() + 1e-5;
-            for value in column.iter_mut() {
+            for value in feature.iter_mut() {
                 *value = (*value - mean) / std;
             }
         }
@@ -97,22 +98,19 @@ impl ParakeetTdtModel {
         Ok(mel_spectrogram)
     }
 
-    fn run_encoder(&mut self, features: &Array2<f32>) -> Result<(Array3<f32>, i64)> {
-        let time_steps = features.shape()[0];
-        let feature_size = features.shape()[1];
-        let input = features
-            .t()
-            .to_shape((1, feature_size, time_steps))
-            .map_err(|err| Error::Backend(format!("failed to reshape encoder input: {err}")))?
-            .to_owned();
-        let input_length = Array1::from_vec(vec![time_steps as i64]);
+    fn run_encoder_and_decode(&mut self, features: &Array2<f32>) -> Result<Vec<usize>> {
+        let time_steps = features.shape()[1];
+        let input = features.view().insert_axis(Axis(0));
+        let input_length = [time_steps as i64];
+        let vocab_size = self.vocab.len();
+        let encoder = &mut self.encoder;
+        let decoder_joint = &mut self.decoder_joint;
 
-        let outputs = self
-            .encoder
+        let outputs = encoder
             .run(ort::inputs!(
-                "audio_signal" => ort::value::Value::from_array(input)
+                "audio_signal" => TensorRef::from_array_view(input)
                     .map_err(|err| Error::Backend(err.to_string()))?,
-                "length" => ort::value::Value::from_array(input_length)
+                "length" => TensorRef::from_array_view(([1usize], &input_length[..]))
                     .map_err(|err| Error::Backend(err.to_string()))?
             ))
             .map_err(|err| Error::Backend(err.to_string()))?;
@@ -133,97 +131,42 @@ impl ParakeetTdtModel {
             )));
         }
 
-        let encoder_array = Array3::from_shape_vec(
-            (
-                shape_dims[0] as usize,
-                shape_dims[1] as usize,
-                shape_dims[2] as usize,
-            ),
-            data.to_vec(),
-        )
-        .map_err(|err| Error::Backend(format!("failed to create encoder array: {err}")))?;
-
-        Ok((encoder_array, lens_data[0]))
-    }
-
-    fn greedy_decode(&mut self, encoder_out: &Array3<f32>, encoder_len: i64) -> Result<Vec<usize>> {
-        let encoder_dim = encoder_out.shape()[1];
-        let time_steps = encoder_out.shape()[2].min(encoder_len.max(0) as usize);
-        let vocab_size = self.vocab.len();
-        let blank_id = vocab_size.saturating_sub(1);
-        let max_tokens_per_step = 10;
-
-        let mut state_h = Array3::<f32>::zeros((2, 1, 640));
-        let mut state_c = Array3::<f32>::zeros((2, 1, 640));
-        let mut tokens = Vec::new();
-        let mut emitted_tokens = 0;
-        let mut last_emitted_token = blank_id as i32;
-        let mut t = 0;
-
-        while t < time_steps {
-            let frame = encoder_out.slice(ndarray::s![0, .., t]).to_owned();
-            let frame_reshaped = frame
-                .to_shape((1, encoder_dim, 1))
-                .map_err(|err| Error::Backend(format!("failed to reshape decoder frame: {err}")))?
-                .to_owned();
-            let targets = Array2::from_shape_vec((1, 1), vec![last_emitted_token])
-                .map_err(|err| Error::Backend(format!("failed to create decoder target: {err}")))?;
-
-            let outputs = self
-                .decoder_joint
-                .run(ort::inputs!(
-                    "encoder_outputs" => ort::value::Value::from_array(frame_reshaped)
-                        .map_err(|err| Error::Backend(err.to_string()))?,
-                    "targets" => ort::value::Value::from_array(targets)
-                        .map_err(|err| Error::Backend(err.to_string()))?,
-                    "target_length" => ort::value::Value::from_array(Array1::from_vec(vec![1i32]))
-                        .map_err(|err| Error::Backend(err.to_string()))?,
-                    "input_states_1" => ort::value::Value::from_array(state_h.clone())
-                        .map_err(|err| Error::Backend(err.to_string()))?,
-                    "input_states_2" => ort::value::Value::from_array(state_c.clone())
-                        .map_err(|err| Error::Backend(err.to_string()))?
-                ))
-                .map_err(|err| Error::Backend(err.to_string()))?;
-
-            let (_, logits_data) =
-                outputs["outputs"]
-                    .try_extract_tensor::<f32>()
-                    .map_err(|err| {
-                        Error::Backend(format!("failed to extract decoder logits: {err}"))
-                    })?;
-            let token_id = logits_data
-                .iter()
-                .take(vocab_size)
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(blank_id);
-            let duration_step = logits_data
-                .iter()
-                .skip(vocab_size)
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-
-            if token_id != blank_id {
-                state_h = extract_state(&outputs["output_states_1"], "output_states_1")?;
-                state_c = extract_state(&outputs["output_states_2"], "output_states_2")?;
-                tokens.push(token_id);
-                last_emitted_token = token_id as i32;
-                emitted_tokens += 1;
-            }
-
-            if duration_step > 0 {
-                t += duration_step;
-                emitted_tokens = 0;
-            } else if token_id == blank_id || emitted_tokens >= max_tokens_per_step {
-                t += 1;
-                emitted_tokens = 0;
-            }
+        let [batch_size, encoder_dim, encoded_frames] = shape_dims else {
+            unreachable!("encoder rank checked above")
+        };
+        let batch_size = usize::try_from(*batch_size)
+            .map_err(|_| Error::Backend(format!("invalid encoder batch size: {batch_size}")))?;
+        let encoder_dim = usize::try_from(*encoder_dim)
+            .map_err(|_| Error::Backend(format!("invalid encoder dimension: {encoder_dim}")))?;
+        let encoded_frames = usize::try_from(*encoded_frames).map_err(|_| {
+            Error::Backend(format!("invalid encoder frame count: {encoded_frames}"))
+        })?;
+        if batch_size != 1 {
+            return Err(Error::Backend(format!(
+                "expected encoder batch size 1, got {batch_size}"
+            )));
         }
+        let expected_values = encoder_dim
+            .checked_mul(encoded_frames)
+            .ok_or_else(|| Error::Backend("encoder output size overflow".to_string()))?;
+        if data.len() < expected_values {
+            return Err(Error::Backend(format!(
+                "encoder output contains {} values, expected at least {expected_values}",
+                data.len()
+            )));
+        }
+        let encoder_len = *lens_data
+            .first()
+            .ok_or_else(|| Error::Backend("encoder returned no length".to_string()))?;
 
-        Ok(tokens)
+        greedy_decode(
+            decoder_joint,
+            data,
+            encoder_dim,
+            encoded_frames,
+            encoder_len,
+            vocab_size,
+        )
     }
 
     fn decode_tokens(&self, tokens: &[usize]) -> String {
@@ -243,6 +186,92 @@ impl ParakeetTdtModel {
         }
         text.trim().to_string()
     }
+}
+
+fn greedy_decode(
+    decoder_joint: &mut Session,
+    encoder_out: &[f32],
+    encoder_dim: usize,
+    encoded_frames: usize,
+    encoder_len: i64,
+    vocab_size: usize,
+) -> Result<Vec<usize>> {
+    let time_steps = encoded_frames.min(encoder_len.max(0) as usize);
+    let blank_id = vocab_size.saturating_sub(1);
+    let max_tokens_per_step = 10;
+
+    let mut state_h = Array3::<f32>::zeros((2, 1, 640));
+    let mut state_c = Array3::<f32>::zeros((2, 1, 640));
+    let mut frame = vec![0.0; encoder_dim];
+    let mut tokens = Vec::new();
+    let mut emitted_tokens = 0;
+    let mut last_emitted_token = blank_id as i32;
+    let mut t = 0;
+    let target_length = [1i32];
+
+    while t < time_steps {
+        for (dimension, value) in frame.iter_mut().enumerate() {
+            *value = encoder_out[dimension * encoded_frames + t];
+        }
+        let targets = [last_emitted_token];
+
+        let outputs = decoder_joint
+            .run(ort::inputs!(
+                "encoder_outputs" => TensorRef::from_array_view((
+                    [1usize, encoder_dim, 1],
+                    frame.as_slice(),
+                ))
+                    .map_err(|err| Error::Backend(err.to_string()))?,
+                "targets" => TensorRef::from_array_view(([1usize, 1], &targets[..]))
+                    .map_err(|err| Error::Backend(err.to_string()))?,
+                "target_length" => TensorRef::from_array_view((
+                    [1usize],
+                    &target_length[..],
+                ))
+                    .map_err(|err| Error::Backend(err.to_string()))?,
+                "input_states_1" => TensorRef::from_array_view(state_h.view())
+                    .map_err(|err| Error::Backend(err.to_string()))?,
+                "input_states_2" => TensorRef::from_array_view(state_c.view())
+                    .map_err(|err| Error::Backend(err.to_string()))?
+            ))
+            .map_err(|err| Error::Backend(err.to_string()))?;
+
+        let (_, logits_data) = outputs["outputs"]
+            .try_extract_tensor::<f32>()
+            .map_err(|err| Error::Backend(format!("failed to extract decoder logits: {err}")))?;
+        let token_id = logits_data
+            .iter()
+            .take(vocab_size)
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx)
+            .unwrap_or(blank_id);
+        let duration_step = logits_data
+            .iter()
+            .skip(vocab_size)
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        if token_id != blank_id {
+            copy_state(&outputs["output_states_1"], "output_states_1", &mut state_h)?;
+            copy_state(&outputs["output_states_2"], "output_states_2", &mut state_c)?;
+            tokens.push(token_id);
+            last_emitted_token = token_id as i32;
+            emitted_tokens += 1;
+        }
+
+        if duration_step > 0 {
+            t += duration_step;
+            emitted_tokens = 0;
+        } else if token_id == blank_id || emitted_tokens >= max_tokens_per_step {
+            t += 1;
+            emitted_tokens = 0;
+        }
+    }
+
+    Ok(tokens)
 }
 
 fn word_boundary_for_vocab(vocab: &[String]) -> WordBoundary {
@@ -360,21 +389,26 @@ fn encoder_feature_size(encoder: &Session) -> Result<usize> {
     Ok(feature_size as usize)
 }
 
-fn extract_state(value: &ort::value::Value, name: &str) -> Result<Array3<f32>> {
+fn copy_state(value: &ort::value::Value, name: &str, destination: &mut Array3<f32>) -> Result<()> {
     let (shape, data) = value
         .try_extract_tensor::<f32>()
         .map_err(|err| Error::Backend(format!("failed to extract {name}: {err}")))?;
     let dims = shape.as_ref();
-    if dims.len() != 3 {
+    let expected = destination.shape();
+    if dims.len() != 3
+        || dims[0] as usize != expected[0]
+        || dims[1] as usize != expected[1]
+        || dims[2] as usize != expected[2]
+    {
         return Err(Error::Backend(format!(
-            "expected 3D {name}, got shape {dims:?}"
+            "expected {name} shape {expected:?}, got {dims:?}"
         )));
     }
-    Array3::from_shape_vec(
-        (dims[0] as usize, dims[1] as usize, dims[2] as usize),
-        data.to_vec(),
-    )
-    .map_err(|err| Error::Backend(format!("failed to create {name}: {err}")))
+    destination
+        .as_slice_mut()
+        .expect("decoder state arrays are contiguous")
+        .copy_from_slice(data);
+    Ok(())
 }
 
 fn find_encoder(dir: &Path) -> Result<PathBuf> {
@@ -441,33 +475,22 @@ fn load_vocab(path: &Path) -> Result<Vec<String>> {
     Ok(vocab)
 }
 
-fn apply_preemphasis(audio: &[f32], coef: f32) -> Vec<f32> {
-    if audio.is_empty() {
-        return Vec::new();
+fn apply_preemphasis_in_place(audio: &mut [f32], coef: f32) {
+    for index in (1..audio.len()).rev() {
+        audio[index] -= coef * audio[index - 1];
     }
-
-    let mut out = Vec::with_capacity(audio.len());
-    out.push(audio[0]);
-    for index in 1..audio.len() {
-        out.push(audio[index] - coef * audio[index - 1]);
-    }
-    out
 }
 
 fn stft_with_plan(
     audio: &[f32],
     plan: &Arc<dyn RealToComplex<f32>>,
+    window: &[f32],
     n_fft: usize,
     hop_length: usize,
-    win_length: usize,
 ) -> Result<Array2<f32>> {
     let pad_amount = n_fft / 2;
-    let mut padded = vec![0.0; pad_amount];
-    padded.extend_from_slice(audio);
-    padded.resize(padded.len() + pad_amount, 0.0);
-
-    let window = hann_window(win_length);
-    let num_frames = (padded.len() - n_fft) / hop_length + 1;
+    let padded_len = audio.len().saturating_add(pad_amount * 2);
+    let num_frames = (padded_len - n_fft) / hop_length + 1;
     let freq_bins = n_fft / 2 + 1;
     let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
     let mut input = vec![0.0; n_fft];
@@ -477,8 +500,13 @@ fn stft_with_plan(
     for frame_idx in 0..num_frames {
         let start = frame_idx * hop_length;
         input.fill(0.0);
-        for sample_idx in 0..win_length.min(padded.len() - start) {
-            input[sample_idx] = padded[start + sample_idx] * window[sample_idx];
+        for (sample_idx, &weight) in window.iter().enumerate() {
+            let padded_index = start + sample_idx;
+            if let Some(audio_index) = padded_index.checked_sub(pad_amount)
+                && let Some(&sample) = audio.get(audio_index)
+            {
+                input[sample_idx] = sample * weight;
+            }
         }
 
         plan.process_with_scratch(&mut input, &mut output, &mut scratch)
@@ -569,6 +597,16 @@ mod tests {
     fn word_boundary_strips_spaces_for_legacy_vocab() {
         let vocab = vec!["<unk>".to_string(), "token".to_string()];
         assert_eq!(word_boundary_for_vocab(&vocab), WordBoundary::Strip);
+    }
+
+    #[test]
+    fn preemphasis_updates_samples_in_place_from_original_predecessors() {
+        let mut audio = [1.0, 2.0, 3.0];
+        apply_preemphasis_in_place(&mut audio, PREEMPHASIS);
+
+        assert_eq!(audio[0], 1.0);
+        assert!((audio[1] - 1.03).abs() < 1e-6);
+        assert!((audio[2] - 1.06).abs() < 1e-6);
     }
 
     #[test]

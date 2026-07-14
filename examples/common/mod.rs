@@ -1,17 +1,8 @@
-#![allow(dead_code)]
-
-use chrono::Local;
 use std::error::Error;
 use std::time::Duration;
-use yamabiko_asr::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
-
-pub mod audio;
+use yamabiko_asr::{Device, Transcriber, TranscriptSegment};
 
 pub type ExampleResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
-
-pub fn local_time() -> String {
-    Local::now().format("%H:%M:%S").to_string()
-}
 
 pub struct ExampleArgs {
     pub model_dir: String,
@@ -82,7 +73,7 @@ pub fn parse_args(usage: &str, extra_positionals: usize) -> ExampleResult<Exampl
     Ok(parsed)
 }
 
-pub fn transcriber_config(args: &ExampleArgs) -> ExampleResult<TranscriberConfig> {
+pub fn load_transcriber(args: &ExampleArgs) -> ExampleResult<Transcriber> {
     let mut builder = Transcriber::builder(&args.model_dir);
     if let Some(device) = args.device {
         builder = builder.device(device);
@@ -102,29 +93,27 @@ pub fn transcriber_config(args: &ExampleArgs) -> ExampleResult<TranscriberConfig
     if let Some(ms) = args.vad_speech_pad_ms {
         builder = builder.vad_speech_pad(Duration::from_millis(ms));
     }
-    Ok(builder.build_config()?)
+    Ok(builder.build()?)
 }
 
-pub fn print_segment(event: TranscriptEvent) -> bool {
-    match event {
-        TranscriptEvent::Segment(segment) => {
-            let inference_seconds = segment.inference_duration.as_secs_f64();
-            let audio_seconds = segment.end.saturating_sub(segment.start).as_secs_f64();
-            let rtf = if audio_seconds > 0.0 {
-                inference_seconds / audio_seconds
-            } else {
-                0.0
-            };
+pub fn print_transcript(segment: &TranscriptSegment, source: Option<&str>) {
+    let inference_seconds = segment.inference_duration.as_secs_f64();
+    let audio_seconds = segment.end.saturating_sub(segment.start).as_secs_f64();
+    let rtf = if audio_seconds > 0.0 {
+        inference_seconds / audio_seconds
+    } else {
+        0.0
+    };
+    let source = source
+        .map(|source| format!("[{source}] "))
+        .unwrap_or_default();
 
-            println!("[{}] {}", local_time(), segment.text);
-            println!(
-                "  Inference {inference_seconds:.2}s / Audio {audio_seconds:.2}s / RTF {rtf:.2}"
-            );
-            true
-        }
-        TranscriptEvent::EndOfStream => false,
-        _ => true,
-    }
+    println!("{source}{}", segment.text);
+    println!(
+        "  Timeline {:.2}-{:.2}s / Inference {inference_seconds:.2}s / Audio {audio_seconds:.2}s / RTF {rtf:.2}",
+        segment.start.as_secs_f64(),
+        segment.end.as_secs_f64(),
+    );
 }
 
 fn parse_value<T>(name: &str, value: Option<String>) -> ExampleResult<T>
