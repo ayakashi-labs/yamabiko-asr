@@ -1,12 +1,18 @@
+#[cfg(target_os = "windows")]
+#[path = "common/audio.rs"]
+mod audio;
+#[cfg(target_os = "windows")]
+#[path = "common/capture.rs"]
+mod capture;
 mod common;
+#[cfg(target_os = "windows")]
+#[path = "common/resampler.rs"]
+mod resampler;
 
 #[cfg(target_os = "windows")]
-use common::capture::{CaptureDevice, print_event};
+use capture::{CaptureDevice, print_event};
 #[cfg(target_os = "windows")]
 use std::time::Instant;
-#[cfg(target_os = "windows")]
-use yamabiko_asr::{AudioSourceConfig, Language, Transcriber};
-
 const USAGE: &str = "usage: audio_input [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> [language]";
 
 // Choose one capture mode by commenting out one line and uncommenting the other.
@@ -17,7 +23,6 @@ const CAPTURE_SYSTEM_AUDIO: bool = true; // microphone + system audio
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> common::ExampleResult<()> {
     let args = common::parse_args(USAGE, 0)?;
-    let config = common::transcriber_config(&args)?;
 
     let host = cpal::default_host();
     let microphone_device = CaptureDevice::microphone(&host)?;
@@ -26,29 +31,17 @@ async fn main() -> common::ExampleResult<()> {
     } else {
         None
     };
-    let execution = config.device;
-    let language = match &config.language {
-        Language::Auto => "auto".to_string(),
-        Language::Hint(hint) => hint.clone(),
-        _ => "unknown".to_string(),
-    };
+    let execution = args.device.unwrap_or_default();
+    let language = args.language.as_deref().unwrap_or("auto");
 
     let started = Instant::now();
-    let transcriber = Transcriber::new(config)?;
-    println!(
-        "[{}] Model loaded in {:.2}s",
-        common::local_time(),
-        started.elapsed().as_secs_f64()
-    );
+    let transcriber = common::load_transcriber(&args)?;
+    println!("Model loaded in {:.2}s", started.elapsed().as_secs_f64());
 
     let session_started = Instant::now();
     let session = transcriber.start();
     let system_input = if CAPTURE_SYSTEM_AUDIO {
-        Some(
-            session
-                .open_source(AudioSourceConfig::system_audio())
-                .await?,
-        )
+        Some(session.open_source().await?)
     } else {
         None
     };
@@ -75,7 +68,7 @@ async fn main() -> common::ExampleResult<()> {
     } else {
         "microphone"
     };
-    println!("[{}] Transcribing {mode}...", common::local_time());
+    println!("Transcribing {mode}...");
     let mut stopping = false;
 
     loop {
@@ -85,7 +78,7 @@ async fn main() -> common::ExampleResult<()> {
                 for capture in &mut captures {
                     capture.stop();
                 }
-                println!("[{}] Stopping...", common::local_time());
+                println!("Stopping...");
             }
             event = events.recv() => {
                 let Some(event) = event else {
@@ -105,7 +98,7 @@ async fn main() -> common::ExampleResult<()> {
         capture.join()?;
     }
     worker.await?;
-    println!("[{}] Stopped.", common::local_time());
+    println!("Stopped.");
 
     Ok(())
 }

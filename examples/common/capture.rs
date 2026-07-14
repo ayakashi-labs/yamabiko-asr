@@ -1,12 +1,12 @@
-use super::audio::{
+use crate::audio::{
     ASR_CHUNK_SAMPLES, AudioResampler, TARGET_SAMPLE_RATE, downmix_to_mono, wasapi_capture_time,
 };
-use super::{ExampleResult, local_time};
+use crate::common::{ExampleResult, print_transcript};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use yamabiko_asr::{AudioInput, AudioSourceId, PcmChunk, TranscriptEvent};
+use yamabiko_asr::{AudioInput, AudioSourceId, TranscriptEvent};
 
 type TimedPcm = (Duration, Vec<f32>);
 
@@ -116,26 +116,13 @@ pub fn print_event(
     match event {
         TranscriptEvent::Segment(segment) => {
             let source = if segment.source_id == microphone_id {
-                "microphone".to_string()
+                "microphone"
             } else if Some(segment.source_id) == system_id {
-                "system".to_string()
+                "system"
             } else {
-                format!("source:{}", segment.source_id.get())
+                "unknown"
             };
-            let inference_seconds = segment.inference_duration.as_secs_f64();
-            let audio_seconds = segment.end.saturating_sub(segment.start).as_secs_f64();
-            let rtf = if audio_seconds > 0.0 {
-                inference_seconds / audio_seconds
-            } else {
-                0.0
-            };
-
-            println!("[{}] [{source}] {}", local_time(), segment.text);
-            println!(
-                "  Timeline {:.2}-{:.2}s / Inference {inference_seconds:.2}s / Audio {audio_seconds:.2}s / RTF {rtf:.2}",
-                segment.start.as_secs_f64(),
-                segment.end.as_secs_f64(),
-            );
+            print_transcript(&segment, Some(source));
             true
         }
         TranscriptEvent::EndOfStream => false,
@@ -200,9 +187,7 @@ fn forward_audio(
         if !timeline_anchored {
             source_started_at.get_or_insert(captured_at);
         }
-        for chunk in resampler.push(&samples)? {
-            asr_buffer.extend(chunk);
-        }
+        resampler.push(&samples, &mut asr_buffer)?;
         send_complete_chunks(
             input,
             &mut asr_buffer,
@@ -211,9 +196,7 @@ fn forward_audio(
         )?;
     }
 
-    for chunk in resampler.finish()? {
-        asr_buffer.extend(chunk);
-    }
+    resampler.finish(&mut asr_buffer)?;
     if !asr_buffer.is_empty() {
         send_chunk(
             input,
@@ -246,10 +229,10 @@ fn send_chunk(
     timeline_anchored: &mut bool,
 ) -> yamabiko_asr::Result<()> {
     if *timeline_anchored {
-        input.blocking_send(PcmChunk::new(chunk))
+        input.blocking_send(chunk)
     } else {
         let timestamp = source_started_at.take().unwrap_or(Duration::ZERO);
-        input.blocking_send_at(timestamp, PcmChunk::new(chunk))?;
+        input.blocking_send_at(timestamp, chunk)?;
         *timeline_anchored = true;
         Ok(())
     }

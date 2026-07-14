@@ -1,21 +1,17 @@
-type ExampleResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#![cfg(target_os = "windows")]
 
-#[path = "../examples/common/audio.rs"]
-mod audio;
+#[path = "../examples/common/resampler.rs"]
+mod resampler;
 
-use audio::AudioResampler;
+use resampler::AudioResampler;
 
 fn resample_in_chunks(input_sample_rate: u32, samples: &[f32]) -> Vec<f32> {
     let mut resampler = AudioResampler::new(input_sample_rate).unwrap();
     let mut output = Vec::new();
     for chunk in samples.chunks(137) {
-        for resampled in resampler.push(chunk).unwrap() {
-            output.extend(resampled);
-        }
+        resampler.push(chunk, &mut output).unwrap();
     }
-    for resampled in resampler.finish().unwrap() {
-        output.extend(resampled);
-    }
+    resampler.finish(&mut output).unwrap();
     output
 }
 

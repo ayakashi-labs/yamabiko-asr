@@ -26,6 +26,9 @@ yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
 - Additional sources are registered explicitly and limited by `max_sources`
   (default: 2, including the primary input). Closing one source flushes and
   releases only that source.
+- All sources share one Silero VAD model session while keeping independent VAD
+  stream state. Long silence is discarded incrementally, and continuous speech
+  is split into utterances of at most 30 seconds by default.
 - Sources can be anchored to a shared session timeline with `send_at`; plain
   `send` starts an unanchored source at session time zero and then advances by
   its PCM sample count.
@@ -39,7 +42,7 @@ yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
 - Current verified model path: `nvidia/parakeet-tdt_ctc-0.6b-ja` for Japanese,
   exported to ONNX.
 - `nvidia/parakeet-tdt-0.6b-v3` can be exported for experimental multilingual
-  testing. In v0.1, run it with automatic language selection; explicit
+  testing. Run it with automatic language selection; explicit
   non-Japanese language hints are not accepted yet.
 - Audio capture, resampling, downmixing, and model download are application
   responsibilities. Examples include small helpers for local testing.
@@ -47,14 +50,14 @@ yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
 ## Minimal Shape
 
 ```rust,no_run
-use yamabiko_asr::{PcmChunk, TranscriptEvent, Transcriber};
+use yamabiko_asr::{TranscriptEvent, Transcriber};
 
 # async fn run() -> yamabiko_asr::Result<()> {
 let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
 let (input, mut events, worker) = transcriber.start().into_parts();
 
 let producer = tokio::spawn(async move {
-    input.send(PcmChunk::new(vec![0.0; 1600])).await?;
+    input.send(vec![0.0; 1600]).await?;
     input.close().await
 });
 
@@ -79,13 +82,13 @@ worker
 ```
 
 For Tauri-style UI events, enable the optional `serde` feature and emit the
-millisecond payload:
+segment directly. Duration fields serialize as millisecond values named
+`start_ms`, `end_ms`, and `inference_ms`:
 
 ```rust,no_run
-# use yamabiko_asr::{TranscriptEvent, TranscriptSegmentPayload};
-# fn emit_to_ui(segment: &yamabiko_asr::TranscriptSegment) {
-let payload: TranscriptSegmentPayload = segment.to_payload();
-// app.emit("transcript-segment", payload)?;
+# use yamabiko_asr::TranscriptSegment;
+# fn emit_to_ui(segment: &TranscriptSegment) {
+// app.emit("transcript-segment", segment)?;
 # }
 ```
 
@@ -100,23 +103,21 @@ replace an earlier version:
 
 ```rust,no_run
 use std::time::Instant;
-use yamabiko_asr::{AudioSourceConfig, PcmChunk, TranscriptEvent, Transcriber};
+use yamabiko_asr::{TranscriptEvent, Transcriber};
 
 # async fn send_audio(
 #     transcriber: Transcriber,
 # ) -> yamabiko_asr::Result<()> {
 let session_started = Instant::now();
 let session = transcriber.start();
-let system_audio = session
-    .open_source(AudioSourceConfig::system_audio())
-    .await?;
+let system_audio = session.open_source().await?;
 let (microphone, mut events, worker) = session.into_parts();
 
 let producer = tokio::spawn(async move {
-    microphone.send(PcmChunk::new(vec![0.0; 1600])).await?;
+    microphone.send(vec![0.0; 1600]).await?;
     let system_started_at = session_started.elapsed();
     system_audio
-        .send_at(system_started_at, PcmChunk::new(vec![0.0; 1600]))
+        .send_at(system_started_at, vec![0.0; 1600])
         .await?;
 
     system_audio.close().await?;
