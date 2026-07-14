@@ -139,38 +139,41 @@ worker
 # }
 ```
 
-## System Audio Loopback
+## Examples
 
-On Windows, CPAL can open the default output device as a WASAPI loopback input
-stream. The `system_audio` example downmixes and resamples that stream to f32
-mono 16 kHz, anchors its first chunk using the WASAPI capture timestamp, and
-transcribes it with the same streaming API:
+Transcribe a mono 16 kHz WAV file:
 
 ```powershell
-cargo run --example system_audio -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --example audio_file -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx .\audio.wav ja
 ```
 
-Play audio through the default output device, then press Ctrl+C to flush the
-final segment and stop. The example currently expects the output mix format to
-be f32 and supports only Windows.
+The Windows-only `audio_input` example captures the default microphone and,
+by default, the default output device through WASAPI loopback. Choose the mode
+near the top of `examples/audio_input.rs` by commenting out one constant and
+uncommenting the other:
 
-To capture the default microphone and system audio at the same time with one
-loaded model, run the combined example:
+```rust
+const CAPTURE_SYSTEM_AUDIO: bool = true; // microphone + system audio
+// const CAPTURE_SYSTEM_AUDIO: bool = false; // microphone only
+```
+
+Run the selected audio-input mode:
 
 ```powershell
-cargo run --example microphone_and_system_audio -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --example audio_input -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 ```
 
-Its output is labeled `[microphone]` or `[system]` using each segment's source
-identifier. Both capture devices must expose an f32 default format. Clock-drift
-correction between independently clocked capture devices is planned for
-long-running sessions.
+Press Ctrl+C to flush the final segments and stop. With system audio enabled,
+output is labeled `[microphone]` or `[system]` using each segment's source
+identifier. Enabled capture devices must expose an f32 default format.
+Clock-drift correction between independently clocked capture devices is
+planned for long-running sessions.
 
 For the Japanese Parakeet TDT model, export ONNX files first:
 
 ```powershell
 python tools/export_parakeet_tdt_ja.py
-cargo run --example microphone -- --vad-min-silence-ms 800 .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --example audio_input -- --vad-min-silence-ms 800 .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 ```
 
 For experimental multilingual Parakeet TDT v3 testing, omit the language
@@ -178,7 +181,7 @@ argument and use automatic language selection:
 
 ```powershell
 python tools/export_parakeet_tdt_multilingual.py
-cargo run --example microphone -- --vad-min-silence-ms 800 .\models\parakeet-tdt-0.6b-v3-onnx
+cargo run --example audio_input -- --vad-min-silence-ms 800 .\models\parakeet-tdt-0.6b-v3-onnx
 ```
 
 The local ONNX runner is used because `nvidia/parakeet-tdt_ctc-0.6b-ja`
@@ -188,9 +191,9 @@ The default build uses CPU execution. ONNX Runtime acceleration providers are
 opt-in Cargo features, for example:
 
 ```powershell
-cargo run --features directml --example microphone -- --device directml .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
-cargo run --features cuda --example microphone -- --device cuda .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
-cargo run --features openvino --example microphone -- --device openvino .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --features directml --example audio_input -- --device directml .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --features cuda --example audio_input -- --device cuda .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --features openvino --example audio_input -- --device openvino .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
 ```
 
 ## License
