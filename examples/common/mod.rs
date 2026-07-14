@@ -6,6 +6,8 @@ use std::time::Duration;
 use yamabiko_asr::{Device, Transcriber, TranscriberConfig, TranscriptEvent};
 
 pub mod audio;
+#[cfg(target_os = "windows")]
+pub mod capture;
 
 pub type ExampleResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
