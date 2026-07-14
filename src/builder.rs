@@ -1,4 +1,4 @@
-use crate::{Device, Language, Result, Transcriber, TranscriberConfig};
+use crate::{Device, Result, Transcriber, TranscriberConfig};
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,16 +18,6 @@ impl TranscriberBuilder {
     pub fn device(mut self, device: Device) -> Self {
         self.config.device = device;
         self
-    }
-
-    pub fn language(mut self, language: Language) -> Self {
-        self.config.language = language;
-        self
-    }
-
-    pub fn language_hint(mut self, hint: impl Into<String>) -> Result<Self> {
-        self.config.language = Language::hint(hint)?;
-        Ok(self)
     }
 
     pub fn vad_threshold(mut self, threshold: f32) -> Self {
@@ -86,8 +76,6 @@ mod tests {
     fn transcriber_builder_builds_validated_config() {
         let builder = Transcriber::builder("model")
             .device(Device::Auto)
-            .language_hint("ja")
-            .unwrap()
             .vad_threshold(0.4)
             .vad_min_speech(Duration::from_millis(300))
             .vad_min_silence(Duration::from_millis(800))
@@ -99,7 +87,6 @@ mod tests {
         let config = builder.config;
 
         assert_eq!(config.device, Device::Auto);
-        assert_eq!(config.language, Language::Hint("ja-JP".to_string()));
         assert_eq!(config.vad.threshold, 0.4);
         assert_eq!(config.vad.min_speech, Duration::from_millis(300));
         assert_eq!(config.vad.min_silence, Duration::from_millis(800));

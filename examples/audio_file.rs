@@ -7,7 +7,7 @@ use yamabiko_asr::TranscriptEvent;
 
 const CHUNK_SAMPLES: usize = yamabiko_asr::PCM_SAMPLE_RATE_HZ as usize / 10;
 
-const USAGE: &str = "usage: audio_file [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> <16k-mono-wav> [language]";
+const USAGE: &str = "usage: audio_file [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> <16k-mono-wav>";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> common::ExampleResult<()> {

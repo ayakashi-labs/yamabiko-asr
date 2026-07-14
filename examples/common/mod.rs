@@ -7,7 +7,6 @@ pub type ExampleResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 pub struct ExampleArgs {
     pub model_dir: String,
     pub extra: Vec<String>,
-    pub language: Option<String>,
     pub device: Option<Device>,
     vad_threshold: Option<f32>,
     vad_min_speech_ms: Option<u64>,
@@ -19,7 +18,6 @@ pub fn parse_args(usage: &str, extra_positionals: usize) -> ExampleResult<Exampl
     let mut parsed = ExampleArgs {
         model_dir: String::new(),
         extra: Vec::new(),
-        language: None,
         device: None,
         vad_threshold: None,
         vad_min_speech_ms: None,
@@ -62,14 +60,12 @@ pub fn parse_args(usage: &str, extra_positionals: usize) -> ExampleResult<Exampl
     }
 
     let min_positionals = 1 + extra_positionals;
-    let max_positionals = min_positionals + 1;
-    if positional.len() < min_positionals || positional.len() > max_positionals {
+    if positional.len() != min_positionals {
         return Err(usage.to_string().into());
     }
 
     parsed.model_dir = positional.remove(0);
     parsed.extra = positional.drain(..extra_positionals).collect();
-    parsed.language = positional.pop();
     Ok(parsed)
 }
 
@@ -77,9 +73,6 @@ pub fn load_transcriber(args: &ExampleArgs) -> ExampleResult<Transcriber> {
     let mut builder = Transcriber::builder(&args.model_dir);
     if let Some(device) = args.device {
         builder = builder.device(device);
-    }
-    if let Some(language) = &args.language {
-        builder = builder.language_hint(language)?;
     }
     if let Some(threshold) = args.vad_threshold {
         builder = builder.vad_threshold(threshold);
