@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Breaking changes
+
+- Removed the unused `Language` type, `Error::InvalidLanguageHint`, and the
+  `TranscriberBuilder::language` and `language_hint` methods. Language behavior
+  is now determined entirely by the loaded model.
+
 ## [0.2.1] - 2026-07-14
 
 ### Fixed
@@ -53,5 +61,6 @@ All notable changes to this project are documented in this file.
 - Corrected 8-, 16-, 24-, and 32-bit integer WAV normalization.
 - Flushed and released each audio source independently.
 
+[Unreleased]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.1.0...v0.2.0

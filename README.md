@@ -68,9 +68,8 @@ Experimental multilingual conversion is also available:
 python tools/export_parakeet_tdt_multilingual.py
 ```
 
-Run `nvidia/parakeet-tdt-0.6b-v3` with automatic language selection. Explicit
-non-Japanese language hints are not accepted yet. Review the upstream model
-license before distributing or using converted model files.
+`nvidia/parakeet-tdt-0.6b-v3` performs automatic language selection. Review the
+upstream model license before distributing or using converted model files.
 
 ## Quick start
 
@@ -210,7 +209,7 @@ Run these commands from a clone of this repository.
 `audio_file` streams a mono 16 kHz WAV instead of loading the entire file:
 
 ```powershell
-cargo run --example audio_file -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx .\audio.wav ja
+cargo run --example audio_file -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx .\audio.wav
 ```
 
 ### Microphone and system audio
@@ -229,7 +228,7 @@ const CAPTURE_SYSTEM_AUDIO: bool = true; // microphone + system audio
 Run the selected mode:
 
 ```powershell
-cargo run --example audio_input -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --example audio_input -- .\models\parakeet-tdt_ctc-0.6b-ja-onnx
 ```
 
 Press Ctrl+C to flush the final segments and stop. Captured devices must expose
@@ -237,7 +236,7 @@ an f32 default format. To use an accelerator, enable its feature and select the
 same device:
 
 ```powershell
-cargo run --features directml --example audio_input -- --device directml .\models\parakeet-tdt_ctc-0.6b-ja-onnx ja
+cargo run --features directml --example audio_input -- --device directml .\models\parakeet-tdt_ctc-0.6b-ja-onnx
 ```
 
 The examples also accept `--vad-threshold`, `--vad-min-speech-ms`,
