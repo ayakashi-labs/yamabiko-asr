@@ -2,6 +2,7 @@
 name = "yamabiko-asr"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "On-device Parakeet-family speech transcription for desktop Rust apps."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ayakashi-labs/yamabiko-asr"
@@ -15,18 +16,19 @@ include = [
     "/LICENSE-*",
     "/examples/**",
     "/src/**",
+    "/tests/**",
     "/tools/**",
 ]
 
 [features]
 default = []
-coreml = ["ort/coreml", "silero/coreml"]
-cuda = ["ort/cuda", "silero/cuda"]
-directml = ["ort/directml", "silero/directml"]
+coreml = ["ort/coreml"]
+cuda = ["ort/cuda"]
+directml = ["ort/directml"]
 onednn = ["ort/onednn"]
-openvino = ["ort/openvino", "silero/openvino"]
-rocm = ["ort/rocm", "silero/rocm"]
-tensorrt = ["ort/tensorrt", "silero/tensorrt"]
+openvino = ["ort/openvino"]
+rocm = ["ort/rocm"]
+tensorrt = ["ort/tensorrt"]
 xnnpack = ["ort/xnnpack"]
 serde = ["dep:serde"]
 
@@ -35,12 +37,16 @@ ndarray = "0.17.2"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24"] }
 realfft = "3.5.0"
 serde = { version = "1.0.228", features = ["derive"], optional = true }
+# silero 0.4 enables ort's defaults internally; remove those transitive
+# features when an upstream release exposes a default-features-free ort edge.
 silero = { version = "0.4.0", default-features = false, features = ["bundled"] }
-tokio = { version = "1.52.3", features = ["rt", "macros", "sync"] }
+tokio = { version = "1.52.3", features = ["rt", "sync"] }
 
 [dev-dependencies]
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+hound = "3.5.1"
+tokio = { version = "1.52.3", features = ["macros", "rt", "sync"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
 cpal = "0.18.1"
 ctrlc = "3.5.2"
-hound = "3.5.1"
-rubato = "3.0.0"
+rubato = "3"
