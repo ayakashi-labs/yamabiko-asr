@@ -3,6 +3,30 @@
 //! The crate owns the PCM streaming API, VAD gating, timestamp accounting, and
 //! Parakeet TDT inference. Audio capture, resampling, downmix, and model
 //! download stay with the application.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use yamabiko_asr::{Error, TranscriptEvent, Transcriber};
+//!
+//! # async fn transcribe() -> yamabiko_asr::Result<()> {
+//! let transcriber = Transcriber::builder("path/to/model").build()?;
+//! let (input, mut events, worker) = transcriber.start().into_parts();
+//!
+//! input.send(vec![0.0; 1_600]).await?;
+//! input.close().await?;
+//!
+//! while let Some(event) = events.recv().await {
+//!     match event? {
+//!         TranscriptEvent::Segment(segment) => println!("{}", segment.text),
+//!         TranscriptEvent::EndOfStream => break,
+//!         _ => {}
+//!     }
+//! }
+//! worker.await.map_err(|_| Error::StreamClosed)?;
+//! # Ok(())
+//! # }
+//! ```
 
 mod backend;
 mod builder;
@@ -13,21 +37,16 @@ mod session;
 mod tdt;
 mod vad;
 
-pub use builder::{TranscriberBuilder, VadConfigBuilder};
-pub use config::{
-    AudioSourceConfig, AudioSourceId, AudioSourceKind, Device, Language, PCM_CHANNELS,
-    PCM_SAMPLE_RATE_HZ, PcmChunk, PcmFormat, TranscriberConfig, VadConfig,
-};
+pub use builder::TranscriberBuilder;
+pub use config::{AudioSourceId, Device, Language, PCM_SAMPLE_RATE_HZ};
+pub(crate) use config::{TranscriberConfig, VadConfig};
 pub use error::{Error, Result};
-pub use event::{
-    SegmentId, SpeakerId, TranscriptEvent, TranscriptEventPayload, TranscriptSegment,
-    TranscriptSegmentPayload,
-};
+pub use event::{SegmentId, SpeakerId, TranscriptEvent, TranscriptSegment};
 pub use session::{AudioInput, TranscriptionSession, TranscriptionWorker};
 
-use backend::{ParakeetTdtModel, RecognitionStream};
+use backend::ParakeetTdtModel;
 use session::{SessionCommand, run_transcription_worker};
-use vad::{SileroVadFactory, SileroVadGate, VadFactory};
+use vad::{SileroVadFactory, VadFactory};
 
 /// A transcription engine backed by one loaded Parakeet ASR model.
 ///
@@ -35,9 +54,9 @@ use vad::{SileroVadFactory, SileroVadGate, VadFactory};
 /// buffering, and source-local timeline state. Sources are scheduled
 /// independently and are not mixed before transcription.
 pub struct Transcriber {
-    config: TranscriberConfig,
+    input_capacity: usize,
+    max_sources: usize,
     model: Box<dyn backend::AsrModel>,
-    stream: RecognitionStream,
     vad: Box<dyn vad::VadGate>,
     vad_factory: Box<dyn VadFactory>,
 }
@@ -47,38 +66,38 @@ impl Transcriber {
     ///
     /// Model loading is synchronous and may take long enough that GUI
     /// applications should call this away from their UI thread.
-    pub fn new(config: TranscriberConfig) -> Result<Self> {
+    pub(crate) fn new(config: TranscriberConfig) -> Result<Self> {
         config.validate()?;
         let model: Box<dyn backend::AsrModel> = Box::new(ParakeetTdtModel::load(&config)?);
-        let vad = Box::new(SileroVadGate::new(config.vad.clone())?);
-        let vad_factory = Box::new(SileroVadFactory::new(config.vad.clone()));
+        let mut vad_factory = SileroVadFactory::new(config.vad.clone())?;
+        let vad = vad_factory.create()?;
         Ok(Self {
-            config,
+            input_capacity: config.input_capacity,
+            max_sources: config.max_sources,
             model,
-            stream: RecognitionStream::default(),
             vad,
-            vad_factory,
+            vad_factory: Box::new(vad_factory),
         })
     }
 
     /// Start the Tokio-facing streaming input/output API.
     ///
     /// The worker runs on Tokio's blocking pool because ONNX inference is
-    /// synchronous. Input and output are bounded channels to provide natural
-    /// backpressure for GUI applications.
+    /// synchronous. The input command channel is bounded to provide natural
+    /// backpressure; transcript events use an unbounded channel so closing an
+    /// input never depends on draining output concurrently.
     ///
     /// # Panics
     ///
     /// Panics when called outside a Tokio runtime.
     pub fn start(self) -> TranscriptionSession {
         let (command_tx, command_rx) =
-            tokio::sync::mpsc::channel::<SessionCommand>(self.config.channel_capacity);
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel(self.config.channel_capacity);
+            tokio::sync::mpsc::channel::<SessionCommand>(self.input_capacity);
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let worker = tokio::task::spawn_blocking(move || {
             run_transcription_worker(
-                self.config,
+                self.max_sources,
                 self.model,
-                self.stream,
                 self.vad,
                 self.vad_factory,
                 command_rx,
@@ -102,12 +121,22 @@ impl Transcriber {
     ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
-            vad_factory: Box::new(SileroVadFactory::new(config.vad.clone())),
-            config,
+            vad_factory: Box::new(UnavailableVadFactory),
+            input_capacity: config.input_capacity,
+            max_sources: config.max_sources,
             model,
-            stream: RecognitionStream::default(),
             vad,
         })
+    }
+}
+
+#[cfg(test)]
+struct UnavailableVadFactory;
+
+#[cfg(test)]
+impl VadFactory for UnavailableVadFactory {
+    fn create(&mut self) -> Result<Box<dyn vad::VadGate>> {
+        Err(Error::Vad("no test VAD configured".to_string()))
     }
 }
 
@@ -123,7 +152,7 @@ mod tests {
     }
 
     impl backend::AsrModel for FakeModel {
-        fn transcribe(&mut self, samples: Vec<f32>, _language: &Language) -> Result<String> {
+        fn transcribe(&mut self, samples: Vec<f32>) -> Result<String> {
             self.calls.lock().unwrap().push(samples.len());
             self.next += 1;
             Ok(format!("chunk{}", self.next))
@@ -135,7 +164,7 @@ mod tests {
     }
 
     impl vad::VadGate for FakeVad {
-        fn push(&mut self, _chunk: &PcmChunk, _start_sample: u64) -> Result<Vec<vad::SpeechChunk>> {
+        fn push(&mut self, _samples: &[f32], _start_sample: u64) -> Result<Vec<vad::SpeechChunk>> {
             if self.chunks.is_empty() {
                 Ok(Vec::new())
             } else {
@@ -167,7 +196,7 @@ mod tests {
     }
 
     impl vad::VadGate for FinishVad {
-        fn push(&mut self, _chunk: &PcmChunk, _start_sample: u64) -> Result<Vec<vad::SpeechChunk>> {
+        fn push(&mut self, _samples: &[f32], _start_sample: u64) -> Result<Vec<vad::SpeechChunk>> {
             Ok(Vec::new())
         }
 
@@ -194,7 +223,6 @@ mod tests {
                     samples: vec![0.2; 4],
                     start_sample: 16_000,
                     end_sample: 16_004,
-                    is_final: false,
                 }],
             ],
         };
@@ -202,16 +230,8 @@ mod tests {
             Transcriber::from_parts(test_config(), Box::new(model), Box::new(vad)).unwrap();
 
         let mut session = transcriber.start();
-        session
-            .input
-            .send(PcmChunk::new(vec![0.0; 4]))
-            .await
-            .unwrap();
-        session
-            .input
-            .send(PcmChunk::new(vec![0.2; 4]))
-            .await
-            .unwrap();
+        session.input.send(vec![0.0; 4]).await.unwrap();
+        session.input.send(vec![0.2; 4]).await.unwrap();
         session.input.close().await.unwrap();
 
         while let Some(event) = session.events.recv().await {
@@ -234,18 +254,13 @@ mod tests {
                 samples: vec![0.2; 8],
                 start_sample: 16_000,
                 end_sample: 24_000,
-                is_final: true,
             }]],
         };
         let transcriber =
             Transcriber::from_parts(test_config(), Box::new(model), Box::new(vad)).unwrap();
 
         let mut session = transcriber.start();
-        session
-            .input
-            .send(PcmChunk::new(vec![0.2; 8]))
-            .await
-            .unwrap();
+        session.input.send(vec![0.2; 8]).await.unwrap();
         session.input.close().await.unwrap();
 
         let event = session.events.recv().await.unwrap().unwrap();
@@ -269,18 +284,13 @@ mod tests {
                 samples: vec![0.1; 8],
                 start_sample: 0,
                 end_sample: 8,
-                is_final: true,
             }]],
         };
         let transcriber =
             Transcriber::from_parts(test_config(), Box::new(model), Box::new(vad)).unwrap();
 
         let mut session = transcriber.start();
-        session
-            .input
-            .send(PcmChunk::new(vec![0.1; 8]))
-            .await
-            .unwrap();
+        session.input.send(vec![0.1; 8]).await.unwrap();
         session.input.close().await.unwrap();
 
         let first = session.events.recv().await.unwrap().unwrap();
@@ -323,7 +333,6 @@ mod tests {
                 samples: vec![0.1; 4],
                 start_sample: 0,
                 end_sample: 4,
-                is_final: true,
             }]],
         };
         let vad_factory = FakeVadFactory {
@@ -332,31 +341,23 @@ mod tests {
                     samples: vec![0.2; 8],
                     start_sample: 0,
                     end_sample: 8,
-                    is_final: true,
                 }]],
             })],
         };
         let transcriber = Transcriber {
-            config: test_config(),
+            input_capacity: 32,
+            max_sources: 2,
             model: Box::new(model),
-            stream: RecognitionStream::default(),
             vad: Box::new(primary_vad),
             vad_factory: Box::new(vad_factory),
         };
 
         let mut session = transcriber.start();
-        let system_input = session
-            .open_source(AudioSourceConfig::system_audio())
-            .await
-            .unwrap();
+        let system_input = session.open_source().await.unwrap();
         let system_source = system_input.source_id();
-        session
-            .input
-            .send(PcmChunk::new(vec![0.1; 4]))
-            .await
-            .unwrap();
+        session.input.send(vec![0.1; 4]).await.unwrap();
         system_input
-            .send_at(Duration::from_millis(350), PcmChunk::new(vec![0.2; 8]))
+            .send_at(Duration::from_millis(350), vec![0.2; 8])
             .await
             .unwrap();
         system_input.close().await.unwrap();
@@ -399,12 +400,12 @@ mod tests {
 
         session
             .input
-            .send_at(Duration::from_millis(100), PcmChunk::new(vec![0.0; 160]))
+            .send_at(Duration::from_millis(100), vec![0.0; 160])
             .await
             .unwrap();
         session
             .input
-            .send_at(Duration::from_millis(105), PcmChunk::new(vec![0.0; 160]))
+            .send_at(Duration::from_millis(105), vec![0.0; 160])
             .await
             .unwrap();
 
@@ -435,7 +436,6 @@ mod tests {
                         samples: vec![0.2; 160],
                         start_sample: 160,
                         end_sample: 320,
-                        is_final: true,
                     }],
                 ],
             }),
@@ -445,14 +445,10 @@ mod tests {
 
         session
             .input
-            .send_at(Duration::from_millis(100), PcmChunk::new(vec![0.0; 160]))
+            .send_at(Duration::from_millis(100), vec![0.0; 160])
             .await
             .unwrap();
-        session
-            .input
-            .send(PcmChunk::new(vec![0.2; 160]))
-            .await
-            .unwrap();
+        session.input.send(vec![0.2; 160]).await.unwrap();
 
         let event = session.events.recv().await.unwrap().unwrap();
         let TranscriptEvent::Segment(segment) = event else {
@@ -476,7 +472,6 @@ mod tests {
                     samples: vec![0.2; 1],
                     start_sample: 0,
                     end_sample: 1,
-                    is_final: true,
                 }]],
             }),
         )
@@ -485,7 +480,7 @@ mod tests {
 
         session
             .input
-            .send_at(Duration::from_nanos(62_501), PcmChunk::new(vec![0.2; 1]))
+            .send_at(Duration::from_nanos(62_501), vec![0.2; 1])
             .await
             .unwrap();
 
@@ -507,13 +502,12 @@ mod tests {
                 samples: vec![0.2; 8],
                 start_sample: 0,
                 end_sample: 8,
-                is_final: true,
             }],
         };
         let transcriber = Transcriber {
-            config: test_config(),
+            input_capacity: 32,
+            max_sources: 2,
             model: Box::new(model),
-            stream: RecognitionStream::default(),
             vad: Box::new(FakeVad { chunks: Vec::new() }),
             vad_factory: Box::new(FakeVadFactory {
                 vads: vec![Box::new(system_source_vad)],
@@ -521,15 +515,9 @@ mod tests {
         };
 
         let mut session = transcriber.start();
-        let system_input = session
-            .open_source(AudioSourceConfig::system_audio())
-            .await
-            .unwrap();
+        let system_input = session.open_source().await.unwrap();
         let system_source = system_input.source_id();
-        system_input
-            .send(PcmChunk::new(vec![0.2; 8]))
-            .await
-            .unwrap();
+        system_input.send(vec![0.2; 8]).await.unwrap();
         system_input.close().await.unwrap();
 
         let event = session.events.recv().await.unwrap().unwrap();
@@ -539,11 +527,7 @@ mod tests {
                 if source_id == system_source
         ));
 
-        session
-            .input
-            .send(PcmChunk::new(vec![0.0; 4]))
-            .await
-            .unwrap();
+        session.input.send(vec![0.0; 4]).await.unwrap();
         session.input.close().await.unwrap();
         assert!(matches!(
             session.events.recv().await.unwrap().unwrap(),
@@ -556,12 +540,12 @@ mod tests {
         let mut config = test_config();
         config.max_sources = 2;
         let transcriber = Transcriber {
-            config,
+            input_capacity: config.input_capacity,
+            max_sources: config.max_sources,
             model: Box::new(FakeModel {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 next: 0,
             }),
-            stream: RecognitionStream::default(),
             vad: Box::new(FakeVad { chunks: Vec::new() }),
             vad_factory: Box::new(FakeVadFactory {
                 vads: vec![
@@ -572,22 +556,13 @@ mod tests {
         };
 
         let mut session = transcriber.start();
-        let first = session
-            .open_source(AudioSourceConfig::system_audio())
-            .await
-            .unwrap();
+        let first = session.open_source().await.unwrap();
         let first_id = first.source_id();
-        let err = session
-            .open_source(AudioSourceConfig::other())
-            .await
-            .unwrap_err();
+        let err = session.open_source().await.unwrap_err();
         assert!(matches!(err, Error::SourceLimit { max_sources: 2 }));
 
         first.close().await.unwrap();
-        let replacement = session
-            .open_source(AudioSourceConfig::other())
-            .await
-            .unwrap();
+        let replacement = session.open_source().await.unwrap();
         assert_ne!(replacement.source_id(), first_id);
         replacement.close().await.unwrap();
         session.input.close().await.unwrap();
@@ -598,29 +573,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_completes_with_event_backpressure_when_events_are_drained() {
+    async fn close_completes_before_events_are_drained() {
         let mut config = test_config();
-        config.channel_capacity = 1;
+        config.input_capacity = 1;
         let transcriber = Transcriber {
-            config,
+            input_capacity: config.input_capacity,
+            max_sources: config.max_sources,
             model: Box::new(FakeModel {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 next: 0,
             }),
-            stream: RecognitionStream::default(),
             vad: Box::new(FinishVad {
                 chunks: vec![
                     vad::SpeechChunk {
                         samples: vec![0.1; 4],
                         start_sample: 0,
                         end_sample: 4,
-                        is_final: true,
                     },
                     vad::SpeechChunk {
                         samples: vec![0.2; 4],
                         start_sample: 4,
                         end_sample: 8,
-                        is_final: true,
                     },
                 ],
             }),
@@ -628,7 +601,7 @@ mod tests {
         };
         let (input, mut events, worker) = transcriber.start().into_parts();
 
-        let producer = tokio::spawn(async move { input.close().await });
+        input.close().await.unwrap();
         let first = events.recv().await.unwrap().unwrap();
         let second = events.recv().await.unwrap().unwrap();
         let end = events.recv().await.unwrap().unwrap();
@@ -636,25 +609,7 @@ mod tests {
         assert!(matches!(first, TranscriptEvent::Segment(_)));
         assert!(matches!(second, TranscriptEvent::Segment(_)));
         assert!(matches!(end, TranscriptEvent::EndOfStream));
-        producer.await.unwrap().unwrap();
         worker.await.unwrap();
-    }
-
-    #[test]
-    fn config_validation_rejects_wrong_pcm_format() {
-        let mut config = test_config();
-        config.pcm_format = PcmFormat {
-            sample_rate_hz: 48_000,
-            channels: 1,
-        };
-
-        assert!(matches!(
-            config.validate(),
-            Err(Error::PcmFormat {
-                expected: _,
-                actual: _
-            })
-        ));
     }
 
     #[test]

@@ -1,61 +1,23 @@
 use crate::{Error, Result};
+use silero::{SampleRate, SpeechOptions};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-/// Required input sample rate for v0.1.
+/// Required input sample rate.
 pub const PCM_SAMPLE_RATE_HZ: u32 = 16_000;
-
-/// Required channel count for v0.1.
-pub const PCM_CHANNELS: u16 = 1;
-
-/// The only PCM format accepted by v0.1: f32, mono, 16 kHz.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PcmFormat {
-    pub sample_rate_hz: u32,
-    pub channels: u16,
-}
-
-impl Default for PcmFormat {
-    fn default() -> Self {
-        Self {
-            sample_rate_hz: PCM_SAMPLE_RATE_HZ,
-            channels: PCM_CHANNELS,
-        }
-    }
-}
-
-impl PcmFormat {
-    pub fn validate(self) -> Result<()> {
-        let expected = Self::default();
-        if self == expected {
-            Ok(())
-        } else {
-            Err(Error::PcmFormat {
-                expected,
-                actual: self,
-            })
-        }
-    }
-}
-
-impl fmt::Display for PcmFormat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "f32 mono={} {}Hz", self.channels, self.sample_rate_hz)
-    }
-}
 
 /// Stable identifier for one audio source in a transcription session.
 ///
 /// Source `0` is reserved for the primary input. Additional identifiers are
 /// allocated by `TranscriptionSession::open_source`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct AudioSourceId(u64);
 
 impl AudioSourceId {
-    /// The default source used by `PcmChunk::new`.
+    /// The primary input created with each transcription session.
     pub const PRIMARY: Self = Self(0);
 
     pub(crate) const fn new(value: u64) -> Self {
@@ -65,65 +27,6 @@ impl AudioSourceId {
     /// Return the numeric representation used in UI payloads.
     pub const fn get(self) -> u64 {
         self.0
-    }
-}
-
-/// Application-level role of an audio source.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum AudioSourceKind {
-    Microphone,
-    SystemAudio,
-    #[default]
-    Other,
-}
-
-/// Configuration used when registering an additional audio source.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AudioSourceConfig {
-    pub kind: AudioSourceKind,
-}
-
-impl AudioSourceConfig {
-    pub fn microphone() -> Self {
-        Self {
-            kind: AudioSourceKind::Microphone,
-        }
-    }
-
-    pub fn system_audio() -> Self {
-        Self {
-            kind: AudioSourceKind::SystemAudio,
-        }
-    }
-
-    pub fn other() -> Self {
-        Self::default()
-    }
-}
-
-/// One chunk of f32 PCM on its source-local audio timeline.
-///
-/// Chunks for each source must be sent in capture order. Every source has an
-/// independent sample counter starting at zero.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct PcmChunk {
-    pub samples: Vec<f32>,
-    pub format: PcmFormat,
-}
-
-impl PcmChunk {
-    pub fn new(samples: Vec<f32>) -> Self {
-        Self {
-            samples,
-            format: PcmFormat::default(),
-        }
-    }
-
-    pub fn with_format(samples: Vec<f32>, format: PcmFormat) -> Self {
-        Self { samples, format }
     }
 }
 
@@ -170,7 +73,7 @@ impl Language {
 ///
 /// `Auto` tries available accelerated providers before CPU. Explicit
 /// accelerator choices return a device error when their provider cannot be
-/// registered. Silero VAD uses its bundled default session in v0.1.
+/// registered. Silero VAD uses its bundled model.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Device {
@@ -226,14 +129,15 @@ impl FromStr for Device {
     }
 }
 
-/// Voice activity detection settings exposed by v0.1.
-#[non_exhaustive]
+/// Voice activity detection settings.
 #[derive(Debug, Clone, PartialEq)]
-pub struct VadConfig {
-    pub threshold: f32,
-    pub min_speech: Duration,
-    pub min_silence: Duration,
-    pub speech_pad: Duration,
+pub(crate) struct VadConfig {
+    pub(crate) threshold: f32,
+    pub(crate) min_speech: Duration,
+    pub(crate) min_silence: Duration,
+    pub(crate) speech_pad: Duration,
+    /// Maximum duration of one ASR utterance before it is split.
+    pub(crate) max_speech: Duration,
 }
 
 impl Default for VadConfig {
@@ -243,32 +147,13 @@ impl Default for VadConfig {
             min_speech: Duration::from_millis(250),
             min_silence: Duration::from_millis(100),
             speech_pad: Duration::from_millis(30),
+            max_speech: Duration::from_secs(30),
         }
     }
 }
 
 impl VadConfig {
-    pub fn with_threshold(mut self, threshold: f32) -> Self {
-        self.threshold = threshold;
-        self
-    }
-
-    pub fn with_min_speech(mut self, min_speech: Duration) -> Self {
-        self.min_speech = min_speech;
-        self
-    }
-
-    pub fn with_min_silence(mut self, min_silence: Duration) -> Self {
-        self.min_silence = min_silence;
-        self
-    }
-
-    pub fn with_speech_pad(mut self, speech_pad: Duration) -> Self {
-        self.speech_pad = speech_pad;
-        self
-    }
-
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if !(0.0..=1.0).contains(&self.threshold) || !self.threshold.is_finite() {
             return Err(Error::InvalidConfig(
                 "VAD threshold must be a finite value from 0.0 to 1.0".to_string(),
@@ -284,7 +169,36 @@ impl VadConfig {
                 "VAD min_silence must be greater than zero".to_string(),
             ));
         }
+        if self.max_speech.is_zero() {
+            return Err(Error::InvalidConfig(
+                "VAD max_speech must be greater than zero".to_string(),
+            ));
+        }
+        let options = self.options();
+        if options
+            .max_speech_samples()
+            .is_some_and(|max| max < options.min_speech_samples())
+        {
+            return Err(Error::InvalidConfig(
+                "VAD max_speech is too short for min_speech and speech_pad".to_string(),
+            ));
+        }
         Ok(())
+    }
+
+    pub(crate) fn speech_options(&self) -> Result<SpeechOptions> {
+        self.validate()?;
+        Ok(self.options())
+    }
+
+    fn options(&self) -> SpeechOptions {
+        SpeechOptions::new()
+            .with_sample_rate(SampleRate::Rate16k)
+            .with_start_threshold(self.threshold)
+            .with_min_speech_duration(self.min_speech)
+            .with_min_silence_duration(self.min_silence)
+            .with_speech_pad(self.speech_pad)
+            .with_max_speech_duration(self.max_speech)
     }
 }
 
@@ -297,95 +211,37 @@ fn normalize_language_hint(hint: &str) -> String {
 }
 
 /// Configuration for loading and running one Parakeet TDT transcriber.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
-pub struct TranscriberConfig {
-    pub model_dir: PathBuf,
-    pub device: Device,
-    pub language: Language,
-    pub vad: VadConfig,
-    pub pcm_format: PcmFormat,
-    pub channel_capacity: usize,
-    pub max_sources: usize,
+pub(crate) struct TranscriberConfig {
+    pub(crate) model_dir: PathBuf,
+    pub(crate) device: Device,
+    pub(crate) language: Language,
+    pub(crate) vad: VadConfig,
+    pub(crate) input_capacity: usize,
+    pub(crate) max_sources: usize,
 }
 
 impl TranscriberConfig {
-    pub fn new(model_dir: impl AsRef<Path>) -> Self {
+    pub(crate) fn new(model_dir: impl AsRef<Path>) -> Self {
         Self {
             model_dir: model_dir.as_ref().to_path_buf(),
             device: Device::default(),
             language: Language::default(),
             vad: VadConfig::default(),
-            pcm_format: PcmFormat::default(),
-            channel_capacity: 32,
+            input_capacity: 32,
             max_sources: 2,
         }
     }
 
-    pub fn with_device(mut self, device: Device) -> Self {
-        self.device = device;
-        self
-    }
-
-    pub fn with_language(mut self, language: Language) -> Self {
-        self.language = language;
-        self
-    }
-
-    pub fn with_language_hint(mut self, hint: impl Into<String>) -> Result<Self> {
-        self.language = Language::hint(hint)?;
-        Ok(self)
-    }
-
-    pub fn with_vad(mut self, vad: VadConfig) -> Self {
-        self.vad = vad;
-        self
-    }
-
-    pub fn with_vad_threshold(mut self, threshold: f32) -> Self {
-        self.vad.threshold = threshold;
-        self
-    }
-
-    pub fn with_vad_min_speech(mut self, min_speech: Duration) -> Self {
-        self.vad.min_speech = min_speech;
-        self
-    }
-
-    pub fn with_vad_min_silence(mut self, min_silence: Duration) -> Self {
-        self.vad.min_silence = min_silence;
-        self
-    }
-
-    pub fn with_vad_speech_pad(mut self, speech_pad: Duration) -> Self {
-        self.vad.speech_pad = speech_pad;
-        self
-    }
-
-    pub fn with_pcm_format(mut self, pcm_format: PcmFormat) -> Self {
-        self.pcm_format = pcm_format;
-        self
-    }
-
-    pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
-        self.channel_capacity = channel_capacity;
-        self
-    }
-
-    pub fn with_max_sources(mut self, max_sources: usize) -> Self {
-        self.max_sources = max_sources;
-        self
-    }
-
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.model_dir.as_os_str().is_empty() {
             return Err(Error::InvalidConfig(
                 "model_dir must point to a local model directory".to_string(),
             ));
         }
-        if self.channel_capacity == 0 {
+        if self.input_capacity == 0 {
             return Err(Error::InvalidConfig(
-                "channel_capacity must be greater than zero".to_string(),
+                "input_capacity must be greater than zero".to_string(),
             ));
         }
         if self.max_sources == 0 {
@@ -393,7 +249,6 @@ impl TranscriberConfig {
                 "max_sources must be greater than zero".to_string(),
             ));
         }
-        self.pcm_format.validate()?;
         self.language.validate()?;
         self.vad.validate()
     }
@@ -404,39 +259,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_builder_methods_set_values() {
-        let vad = VadConfig::default()
-            .with_threshold(0.4)
-            .with_min_speech(Duration::from_millis(300))
-            .with_min_silence(Duration::from_millis(800))
-            .with_speech_pad(Duration::from_millis(40));
-
-        let config = TranscriberConfig::new("model")
-            .with_device(Device::Auto)
-            .with_language(Language::Auto)
-            .with_vad(vad.clone())
-            .with_channel_capacity(8)
-            .with_max_sources(4);
-
-        assert_eq!(config.device, Device::Auto);
-        assert_eq!(config.language, Language::Auto);
-        assert_eq!(config.vad, vad);
-        assert_eq!(config.channel_capacity, 8);
-        assert_eq!(config.max_sources, 4);
-    }
-
-    #[test]
-    fn config_builder_accepts_language_hint() {
-        let config = TranscriberConfig::new("model")
-            .with_language_hint("ja")
-            .unwrap();
-
-        assert_eq!(config.language, Language::Hint("ja-JP".to_string()));
+    fn language_hint_normalizes_short_codes() {
+        assert_eq!(
+            Language::hint("ja").unwrap(),
+            Language::Hint("ja-JP".to_string())
+        );
     }
 
     #[test]
     fn config_rejects_zero_max_sources() {
-        let config = TranscriberConfig::new("model").with_max_sources(0);
+        let mut config = TranscriberConfig::new("model");
+        config.max_sources = 0;
         assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn vad_rejects_max_speech_shorter_than_emittable_segment() {
+        let mut config = VadConfig {
+            max_speech: Duration::from_millis(341),
+            ..VadConfig::default()
+        };
+        assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
+
+        config.max_speech = Duration::from_millis(342);
+        config.validate().unwrap();
     }
 }

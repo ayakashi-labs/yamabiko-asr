@@ -1,4 +1,4 @@
-use crate::{AudioSourceId, Device, PcmFormat};
+use crate::{AudioSourceId, Device};
 use std::fmt;
 use std::time::Duration;
 
@@ -9,11 +9,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
-    /// Input PCM did not match the required v0.1 format.
-    PcmFormat {
-        expected: PcmFormat,
-        actual: PcmFormat,
-    },
     /// A language hint was empty or not accepted by the Parakeet backend.
     InvalidLanguageHint(String),
     /// A configuration value was outside the supported range.
@@ -49,10 +44,6 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PcmFormat { expected, actual } => write!(
-                f,
-                "unsupported PCM format: expected {expected}, got {actual}"
-            ),
             Self::InvalidLanguageHint(hint) => write!(f, "invalid language hint: {hint}"),
             Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
             Self::DeviceUnavailable { device, message } => {
