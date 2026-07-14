@@ -77,29 +77,29 @@ license before distributing or using converted model files.
 `AudioInput::send` accepts any chunk size. This example sends already-converted
 PCM and then drains the final transcript events:
 
-```rust,no_run
+```rust
 use yamabiko_asr::{Error, TranscriptEvent, Transcriber};
 
-# async fn transcribe(pcm: Vec<f32>) -> yamabiko_asr::Result<()> {
-let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
-let (input, mut events, worker) = transcriber.start().into_parts();
+async fn transcribe(pcm: Vec<f32>) -> yamabiko_asr::Result<()> {
+    let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
+    let (input, mut events, worker) = transcriber.start().into_parts();
 
-input.send(pcm).await?;
-input.close().await?;
+    input.send(pcm).await?;
+    input.close().await?;
 
-while let Some(event) = events.recv().await {
-    match event? {
-        TranscriptEvent::Segment(segment) => {
-            println!("{}ms: {}", segment.start_ms(), segment.text);
+    while let Some(event) = events.recv().await {
+        match event? {
+            TranscriptEvent::Segment(segment) => {
+                println!("{}ms: {}", segment.start_ms(), segment.text);
+            }
+            TranscriptEvent::EndOfStream => break,
+            _ => {}
         }
-        TranscriptEvent::EndOfStream => break,
-        _ => {}
     }
-}
 
-worker.await.map_err(|_| Error::StreamClosed)?;
-# Ok(())
-# }
+    worker.await.map_err(|_| Error::StreamClosed)?;
+    Ok(())
+}
 ```
 
 Model loading and ONNX inference are synchronous. Build the `Transcriber` away
@@ -112,49 +112,49 @@ Additional sources share the loaded ASR and VAD models, but keep independent
 PCM buffers, VAD state, and source-local timelines. Audio sources are not mixed
 before transcription.
 
-```rust,no_run
+```rust
 use std::time::Duration;
-use yamabiko_asr::{TranscriptEvent, Transcriber};
+use yamabiko_asr::{Error, TranscriptEvent, Transcriber};
 
-# async fn transcribe_two_sources(
-#     microphone_pcm: Vec<f32>,
-#     system_pcm: Vec<f32>,
-# ) -> yamabiko_asr::Result<()> {
-let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
-let session = transcriber.start();
-let system_audio = session.open_source().await?;
-let microphone_id = session.input.source_id();
-let system_id = system_audio.source_id();
-let (microphone, mut events, worker) = session.into_parts();
+async fn transcribe_two_sources(
+    microphone_pcm: Vec<f32>,
+    system_pcm: Vec<f32>,
+) -> yamabiko_asr::Result<()> {
+    let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
+    let session = transcriber.start();
+    let system_audio = session.open_source().await?;
+    let microphone_id = session.input.source_id();
+    let system_id = system_audio.source_id();
+    let (microphone, mut events, worker) = session.into_parts();
 
-microphone
-    .send_at(Duration::ZERO, microphone_pcm)
-    .await?;
-system_audio.send_at(Duration::ZERO, system_pcm).await?;
+    microphone
+        .send_at(Duration::ZERO, microphone_pcm)
+        .await?;
+    system_audio.send_at(Duration::ZERO, system_pcm).await?;
 
-system_audio.close().await?;
-microphone.close().await?;
+    system_audio.close().await?;
+    microphone.close().await?;
 
-while let Some(event) = events.recv().await {
-    match event? {
-        TranscriptEvent::Segment(segment) => {
-            let source = if segment.source_id == microphone_id {
-                "microphone"
-            } else if segment.source_id == system_id {
-                "system"
-            } else {
-                "unknown"
-            };
-            println!("[{source}] {}", segment.text);
+    while let Some(event) = events.recv().await {
+        match event? {
+            TranscriptEvent::Segment(segment) => {
+                let source = if segment.source_id == microphone_id {
+                    "microphone"
+                } else if segment.source_id == system_id {
+                    "system"
+                } else {
+                    "unknown"
+                };
+                println!("[{source}] {}", segment.text);
+            }
+            TranscriptEvent::EndOfStream => break,
+            _ => {}
         }
-        TranscriptEvent::EndOfStream => break,
-        _ => {}
     }
-}
 
-worker.await.unwrap();
-# Ok(())
-# }
+    worker.await.map_err(|_| Error::StreamClosed)?;
+    Ok(())
+}
 ```
 
 The first `send_at` anchors a source to the shared session timeline. Following
@@ -163,12 +163,14 @@ integrations should derive the first timestamp from the audio device clock.
 
 `max_sources` defaults to 2, including the primary input:
 
-```rust,no_run
-# use yamabiko_asr::Transcriber;
-let transcriber = Transcriber::builder("path/to/model")
-    .max_sources(4)
-    .build()?;
-# Ok::<(), yamabiko_asr::Error>(())
+```rust
+use yamabiko_asr::Transcriber;
+
+fn configured_transcriber() -> yamabiko_asr::Result<Transcriber> {
+    Transcriber::builder("path/to/model")
+        .max_sources(4)
+        .build()
+}
 ```
 
 ## Transcript events and serialization
