@@ -13,7 +13,7 @@ mod resampler;
 use capture::{CaptureDevice, print_event};
 #[cfg(target_os = "windows")]
 use std::time::Instant;
-const USAGE: &str = "usage: audio_input [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir> [language]";
+const USAGE: &str = "usage: audio_input [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir>";
 
 // Choose one capture mode by commenting out one line and uncommenting the other.
 const CAPTURE_SYSTEM_AUDIO: bool = true; // microphone + system audio
@@ -32,7 +32,6 @@ async fn main() -> common::ExampleResult<()> {
         None
     };
     let execution = args.device.unwrap_or_default();
-    let language = args.language.as_deref().unwrap_or("auto");
 
     let started = Instant::now();
     let transcriber = common::load_transcriber(&args)?;
@@ -53,7 +52,7 @@ async fn main() -> common::ExampleResult<()> {
     if let (Some(device), Some(input)) = (system_device, system_input) {
         captures.push(device.start(session_started, input)?);
     }
-    println!("  Execution {execution} / Language {language}");
+    println!("  Execution {execution}");
 
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
     ctrlc::set_handler(move || {

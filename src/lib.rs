@@ -38,7 +38,7 @@ mod tdt;
 mod vad;
 
 pub use builder::TranscriberBuilder;
-pub use config::{AudioSourceId, Device, Language, PCM_SAMPLE_RATE_HZ};
+pub use config::{AudioSourceId, Device, PCM_SAMPLE_RATE_HZ};
 pub(crate) use config::{TranscriberConfig, VadConfig};
 pub use error::{Error, Result};
 pub use event::{SegmentId, SpeakerId, TranscriptEvent, TranscriptSegment};
@@ -610,17 +610,6 @@ mod tests {
         assert!(matches!(second, TranscriptEvent::Segment(_)));
         assert!(matches!(end, TranscriptEvent::EndOfStream));
         worker.await.unwrap();
-    }
-
-    #[test]
-    fn config_validation_rejects_bad_language_hint() {
-        let mut config = test_config();
-        config.language = Language::Hint("".to_string());
-
-        assert!(matches!(
-            config.validate(),
-            Err(Error::InvalidLanguageHint(_))
-        ));
     }
 
     #[test]

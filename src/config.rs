@@ -30,45 +30,6 @@ impl AudioSourceId {
     }
 }
 
-/// Optional language target for multilingual models.
-#[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Language {
-    #[default]
-    Auto,
-    Hint(String),
-}
-
-impl Language {
-    pub fn hint(value: impl Into<String>) -> Result<Self> {
-        let hint = value.into();
-        Self::validate_hint(&hint)?;
-        Ok(Self::Hint(normalize_language_hint(&hint)))
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        match self {
-            Self::Auto => Ok(()),
-            Self::Hint(hint) => Self::validate_hint(hint),
-        }
-    }
-
-    fn validate_hint(hint: &str) -> Result<()> {
-        let normalized = normalize_language_hint(hint);
-        let valid = !normalized.is_empty()
-            && normalized.len() <= 16
-            && normalized
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-');
-
-        if valid {
-            Ok(())
-        } else {
-            Err(Error::InvalidLanguageHint(hint.to_string()))
-        }
-    }
-}
-
 /// Preferred execution device for the Parakeet TDT ONNX sessions.
 ///
 /// `Auto` tries available accelerated providers before CPU. Explicit
@@ -202,20 +163,11 @@ impl VadConfig {
     }
 }
 
-fn normalize_language_hint(hint: &str) -> String {
-    match hint.trim() {
-        "ja" => "ja-JP".to_string(),
-        "en" => "en-US".to_string(),
-        other => other.to_string(),
-    }
-}
-
 /// Configuration for loading and running one Parakeet TDT transcriber.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TranscriberConfig {
     pub(crate) model_dir: PathBuf,
     pub(crate) device: Device,
-    pub(crate) language: Language,
     pub(crate) vad: VadConfig,
     pub(crate) input_capacity: usize,
     pub(crate) max_sources: usize,
@@ -226,7 +178,6 @@ impl TranscriberConfig {
         Self {
             model_dir: model_dir.as_ref().to_path_buf(),
             device: Device::default(),
-            language: Language::default(),
             vad: VadConfig::default(),
             input_capacity: 32,
             max_sources: 2,
@@ -249,7 +200,6 @@ impl TranscriberConfig {
                 "max_sources must be greater than zero".to_string(),
             ));
         }
-        self.language.validate()?;
         self.vad.validate()
     }
 }
@@ -257,14 +207,6 @@ impl TranscriberConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn language_hint_normalizes_short_codes() {
-        assert_eq!(
-            Language::hint("ja").unwrap(),
-            Language::Hint("ja-JP".to_string())
-        );
-    }
 
     #[test]
     fn config_rejects_zero_max_sources() {

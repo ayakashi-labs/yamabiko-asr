@@ -9,8 +9,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
-    /// A language hint was empty or not accepted by the Parakeet backend.
-    InvalidLanguageHint(String),
     /// A configuration value was outside the supported range.
     InvalidConfig(String),
     /// The requested execution device could not be used.
@@ -44,7 +42,6 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidLanguageHint(hint) => write!(f, "invalid language hint: {hint}"),
             Self::InvalidConfig(message) => write!(f, "invalid configuration: {message}"),
             Self::DeviceUnavailable { device, message } => {
                 write!(f, "execution device {device} is unavailable: {message}")
