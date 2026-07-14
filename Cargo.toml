@@ -1,6 +1,6 @@
 [package]
 name = "yamabiko-asr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "On-device Parakeet-family speech transcription for desktop Rust apps."
@@ -12,6 +12,7 @@ categories = ["multimedia::audio"]
 include = [
     "/Cargo.toml",
     "/Cargo.lock",
+    "/CHANGELOG.md",
     "/README.md",
     "/LICENSE-*",
     "/examples/**",

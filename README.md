@@ -37,13 +37,13 @@ one Windows implementation of that layer.
 
 ```toml
 [dependencies]
-yamabiko-asr = "0.1"
+yamabiko-asr = "0.2"
 ```
 
 Enable only the optional features your application uses. For example:
 
 ```toml
-yamabiko-asr = { version = "0.1", features = ["serde", "directml"] }
+yamabiko-asr = { version = "0.2", features = ["serde", "directml"] }
 ```
 
 ## Model setup
