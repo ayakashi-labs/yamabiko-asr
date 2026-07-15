@@ -3,12 +3,32 @@ use crate::audio::{
 };
 use crate::common::{ExampleResult, print_transcript};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use yamabiko_asr::{AudioInput, AudioSourceId, TranscriptEvent};
 
 type TimedPcm = (Duration, Vec<f32>);
+const PCM_QUEUE_CAPACITY: usize = 64;
+
+enum CaptureMessage {
+    Pcm(TimedPcm),
+    Wake,
+}
+
+#[derive(Default)]
+struct CaptureFailure(OnceLock<String>);
+
+impl CaptureFailure {
+    fn record(&self, message: String) -> bool {
+        self.0.set(message).is_ok()
+    }
+
+    fn message(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
 
 pub struct CaptureDevice {
     label: &'static str,
@@ -45,7 +65,12 @@ impl CaptureDevice {
         })
     }
 
-    pub fn start(self, session_started: Instant, input: AudioInput) -> ExampleResult<Capture> {
+    pub fn start(
+        self,
+        session_started: Instant,
+        input: AudioInput,
+        failure_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> ExampleResult<Capture> {
         let device_name = self
             .device
             .description()
@@ -54,15 +79,49 @@ impl CaptureDevice {
         let channels = self.supported.channels() as usize;
         let sample_rate = self.supported.sample_rate();
         let sample_format = self.supported.sample_format();
-        let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<TimedPcm>();
+        let label = self.label;
+        let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel(PCM_QUEUE_CAPACITY);
+        let failure = Arc::new(CaptureFailure::default());
+        let data_pcm_tx = pcm_tx.clone();
+        let data_failure = Arc::clone(&failure);
+        let data_failure_tx = failure_tx.clone();
+        let error_failure = Arc::clone(&failure);
+        let error_failure_tx = failure_tx.clone();
         let stream = self.device.build_input_stream(
             self.supported.into(),
             move |data: &[f32], info| {
+                if data_failure.message().is_some() {
+                    return;
+                }
                 let captured_at = wasapi_capture_time(session_started, info);
                 let samples = downmix_to_mono(data, channels);
-                let _ = pcm_tx.send((captured_at, samples));
+                match data_pcm_tx.try_send(CaptureMessage::Pcm((captured_at, samples))) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => report_capture_failure(
+                        label,
+                        format!("PCM queue reached its {PCM_QUEUE_CAPACITY}-buffer limit"),
+                        &data_failure,
+                        &data_failure_tx,
+                        &data_pcm_tx,
+                    ),
+                    Err(TrySendError::Disconnected(_)) => report_capture_failure(
+                        label,
+                        "audio forwarding thread stopped".to_string(),
+                        &data_failure,
+                        &data_failure_tx,
+                        &data_pcm_tx,
+                    ),
+                }
             },
-            move |err| eprintln!("{} stream error: {err}", self.label),
+            move |err| {
+                report_capture_failure(
+                    label,
+                    format!("stream error: {err}"),
+                    &error_failure,
+                    &error_failure_tx,
+                    &pcm_tx,
+                );
+            },
             None,
         )?;
 
@@ -76,7 +135,7 @@ impl CaptureDevice {
         Ok(Capture {
             label: self.label,
             stream: Some(stream),
-            forwarder: spawn_forwarder(self.label, input, sample_rate, pcm_rx),
+            forwarder: spawn_forwarder(self.label, input, sample_rate, pcm_rx, failure, failure_tx),
         })
     }
 }
@@ -84,7 +143,7 @@ impl CaptureDevice {
 pub struct Capture {
     label: &'static str,
     stream: Option<cpal::Stream>,
-    forwarder: JoinHandle<()>,
+    forwarder: JoinHandle<ExampleResult<()>>,
 }
 
 impl Capture {
@@ -102,9 +161,10 @@ impl Capture {
 
     pub fn join(mut self) -> ExampleResult<()> {
         self.stop();
-        self.forwarder
-            .join()
-            .map_err(|_| format!("{} forwarding thread panicked", self.label).into())
+        match self.forwarder.join() {
+            Ok(result) => result,
+            Err(_) => Err(format!("{} forwarding thread panicked", self.label).into()),
+        }
     }
 }
 
@@ -161,29 +221,61 @@ fn spawn_forwarder(
     label: &'static str,
     input: AudioInput,
     sample_rate: u32,
-    pcm_rx: Receiver<TimedPcm>,
-) -> JoinHandle<()> {
+    pcm_rx: Receiver<CaptureMessage>,
+    failure: Arc<CaptureFailure>,
+    failure_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> JoinHandle<ExampleResult<()>> {
     std::thread::spawn(move || {
-        if let Err(err) = forward_audio(&input, sample_rate, pcm_rx) {
-            eprintln!("{label} forwarding failed: {err}");
+        let forward_result = forward_audio(&input, sample_rate, pcm_rx, &failure);
+        let close_result = input.blocking_close();
+        let result: ExampleResult<()> = match (forward_result, close_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(format!("failed to close input: {error}").into()),
+            (Err(forward_error), Err(close_error)) => Err(format!(
+                "{forward_error}; additionally failed to close input: {close_error}"
+            )
+            .into()),
+        };
+        if let Err(err) = result {
+            let capture_failed = failure.message().is_some();
+            let operation = if capture_failed {
+                "capture"
+            } else {
+                "forwarding"
+            };
+            let message = format!("{label} {operation} failed: {err}");
+            if !capture_failed {
+                let _ = failure_tx.send(message.clone());
+            }
+            return Err(message.into());
         }
-        if let Err(err) = input.blocking_close() {
-            eprintln!("failed to close {label} input: {err}");
-        }
+        Ok(())
     })
 }
 
 fn forward_audio(
     input: &AudioInput,
     sample_rate: u32,
-    pcm_rx: Receiver<TimedPcm>,
+    pcm_rx: Receiver<CaptureMessage>,
+    failure: &CaptureFailure,
 ) -> ExampleResult<()> {
     let mut resampler = AudioResampler::new(sample_rate)?;
     let mut asr_buffer = Vec::with_capacity(ASR_CHUNK_SAMPLES * 2);
     let mut source_started_at = None;
     let mut timeline_anchored = false;
 
-    while let Ok((captured_at, samples)) = pcm_rx.recv() {
+    loop {
+        if let Some(message) = failure.message() {
+            return Err(message.to_string().into());
+        }
+        let message = match pcm_rx.recv() {
+            Ok(message) => message,
+            Err(_) => break,
+        };
+        let CaptureMessage::Pcm((captured_at, samples)) = message else {
+            continue;
+        };
         if !timeline_anchored {
             source_started_at.get_or_insert(captured_at);
         }
@@ -196,6 +288,10 @@ fn forward_audio(
         )?;
     }
 
+    if let Some(message) = failure.message() {
+        return Err(message.to_string().into());
+    }
+
     resampler.finish(&mut asr_buffer)?;
     if !asr_buffer.is_empty() {
         send_chunk(
@@ -206,6 +302,19 @@ fn forward_audio(
         )?;
     }
     Ok(())
+}
+
+fn report_capture_failure(
+    label: &str,
+    message: String,
+    failure: &CaptureFailure,
+    failure_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    pcm_tx: &SyncSender<CaptureMessage>,
+) {
+    if failure.record(message.clone()) {
+        let _ = failure_tx.send(format!("{label} capture failed: {message}"));
+        let _ = pcm_tx.try_send(CaptureMessage::Wake);
+    }
 }
 
 fn send_complete_chunks(
@@ -235,5 +344,40 @@ fn send_chunk(
         input.blocking_send_at(timestamp, chunk)?;
         *timeline_anchored = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_failure_is_bounded_to_first_notification() {
+        let failure = CaptureFailure::default();
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pcm_tx, _pcm_rx) = std::sync::mpsc::sync_channel(1);
+        assert!(pcm_tx.try_send(CaptureMessage::Wake).is_ok());
+
+        report_capture_failure(
+            "microphone",
+            "first".to_string(),
+            &failure,
+            &failure_tx,
+            &pcm_tx,
+        );
+        report_capture_failure(
+            "microphone",
+            "second".to_string(),
+            &failure,
+            &failure_tx,
+            &pcm_tx,
+        );
+
+        assert_eq!(failure.message(), Some("first"));
+        assert_eq!(
+            failure_rx.try_recv().unwrap(),
+            "microphone capture failed: first"
+        );
+        assert!(failure_rx.try_recv().is_err());
     }
 }
