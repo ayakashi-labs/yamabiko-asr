@@ -1,8 +1,8 @@
 use crate::{Device, Error, PCM_SAMPLE_RATE_HZ, Result};
 use ndarray::{Array2, Array3, Axis};
 use ort::ep::ExecutionProviderDispatch;
-use ort::session::{Session, builder::GraphOptimizationLevel};
-use ort::value::{TensorRef, ValueType};
+use ort::session::{Session, SessionOutputs, builder::GraphOptimizationLevel};
+use ort::value::{DynValue, Outlet, TensorElementType, TensorRef, ValueType};
 use realfft::RealToComplex;
 use std::f32::consts::PI;
 use std::fs::File;
@@ -14,7 +14,14 @@ const N_FFT: usize = 512;
 const HOP_LENGTH: usize = 160;
 const WIN_LENGTH: usize = 400;
 const PREEMPHASIS: f32 = 0.97;
+const DECODER_STATE_LAYERS: usize = 2;
+const DECODER_STATE_SIZE: usize = 640;
 const SENTENCEPIECE_SPACE: char = '\u{2581}';
+
+struct EncoderContract {
+    feature_size: usize,
+    encoded_size: Option<usize>,
+}
 
 pub(crate) struct ParakeetTdtModel {
     encoder: Session,
@@ -43,10 +50,15 @@ impl ParakeetTdtModel {
 
         let encoder = build_session(&find_encoder(model_dir)?, device)?;
         let decoder_joint = build_session(&find_decoder_joint(model_dir)?, device)?;
-        let feature_size = encoder_feature_size(&encoder)?;
         let vocab = load_vocab(&model_dir.join("vocab.txt"))?;
+        let encoder_contract = validate_encoder_contract(&encoder)?;
+        validate_decoder_joint_contract(&decoder_joint, &encoder_contract, vocab.len())?;
         let word_boundary = word_boundary_for_vocab(&vocab);
-        let mel_basis = create_mel_filterbank(N_FFT, feature_size, PCM_SAMPLE_RATE_HZ as usize);
+        let mel_basis = create_mel_filterbank(
+            N_FFT,
+            encoder_contract.feature_size,
+            PCM_SAMPLE_RATE_HZ as usize,
+        );
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_plan = planner.plan_fft_forward(N_FFT);
         let window = hann_window(WIN_LENGTH);
@@ -107,24 +119,20 @@ impl ParakeetTdtModel {
             ))
             .map_err(|err| Error::Backend(err.to_string()))?;
 
-        let encoder_out = &outputs["outputs"];
-        let encoder_lens = &outputs["encoded_lengths"];
+        let encoder_out = required_output(&outputs, "encoder", "outputs")?;
+        let encoder_lens = required_output(&outputs, "encoder", "encoded_lengths")?;
         let (shape, data) = encoder_out
             .try_extract_tensor::<f32>()
             .map_err(|err| Error::Backend(format!("failed to extract encoder output: {err}")))?;
-        let (_, lens_data) = encoder_lens
+        let (lens_shape, lens_data) = encoder_lens
             .try_extract_tensor::<i64>()
             .map_err(|err| Error::Backend(format!("failed to extract encoder length: {err}")))?;
 
         let shape_dims = shape.as_ref();
-        if shape_dims.len() != 3 {
+        let [batch_size, encoder_dim, encoded_frames] = shape_dims else {
             return Err(Error::Backend(format!(
                 "expected 3D encoder output, got shape {shape_dims:?}"
             )));
-        }
-
-        let [batch_size, encoder_dim, encoded_frames] = shape_dims else {
-            unreachable!("encoder rank checked above")
         };
         let batch_size = usize::try_from(*batch_size)
             .map_err(|_| Error::Backend(format!("invalid encoder batch size: {batch_size}")))?;
@@ -141,15 +149,25 @@ impl ParakeetTdtModel {
         let expected_values = encoder_dim
             .checked_mul(encoded_frames)
             .ok_or_else(|| Error::Backend("encoder output size overflow".to_string()))?;
-        if data.len() < expected_values {
+        if data.len() != expected_values {
             return Err(Error::Backend(format!(
-                "encoder output contains {} values, expected at least {expected_values}",
+                "encoder output contains {} values, expected {expected_values}",
                 data.len()
             )));
         }
-        let encoder_len = *lens_data
-            .first()
-            .ok_or_else(|| Error::Backend("encoder returned no length".to_string()))?;
+        if lens_shape.as_ref() != [1] || lens_data.len() != 1 {
+            return Err(Error::Backend(format!(
+                "expected encoder length shape [1], got {:?}",
+                lens_shape.as_ref()
+            )));
+        }
+        let encoder_len = usize::try_from(lens_data[0])
+            .map_err(|_| Error::Backend(format!("invalid encoder length: {}", lens_data[0])))?;
+        if encoder_len > encoded_frames {
+            return Err(Error::Backend(format!(
+                "encoder length {encoder_len} exceeds output frame count {encoded_frames}"
+            )));
+        }
 
         greedy_decode(
             decoder_joint,
@@ -219,19 +237,21 @@ fn greedy_decode(
     encoder_out: &[f32],
     encoder_dim: usize,
     encoded_frames: usize,
-    encoder_len: i64,
+    time_steps: usize,
     vocab_size: usize,
 ) -> Result<Vec<usize>> {
-    let time_steps = encoded_frames.min(encoder_len.max(0) as usize);
-    let blank_id = vocab_size.saturating_sub(1);
+    let blank_id = vocab_size
+        .checked_sub(1)
+        .ok_or_else(|| Error::Backend("decoder vocabulary is empty".to_string()))?;
     let max_tokens_per_step = 10;
 
-    let mut state_h = Array3::<f32>::zeros((2, 1, 640));
-    let mut state_c = Array3::<f32>::zeros((2, 1, 640));
+    let mut state_h = Array3::<f32>::zeros((DECODER_STATE_LAYERS, 1, DECODER_STATE_SIZE));
+    let mut state_c = Array3::<f32>::zeros((DECODER_STATE_LAYERS, 1, DECODER_STATE_SIZE));
     let mut frame = vec![0.0; encoder_dim];
     let mut tokens = Vec::new();
     let mut emitted_tokens = 0;
-    let mut last_emitted_token = blank_id as i32;
+    let mut last_emitted_token = i32::try_from(blank_id)
+        .map_err(|_| Error::Backend("vocabulary is too large for decoder input".to_string()))?;
     let mut t = 0;
     let target_length = [1i32];
 
@@ -262,9 +282,35 @@ fn greedy_decode(
             ))
             .map_err(|err| Error::Backend(err.to_string()))?;
 
-        let (_, logits_data) = outputs["outputs"]
+        let logits = required_output(&outputs, "decoder", "outputs")?;
+        let (logits_shape, logits_data) = logits
             .try_extract_tensor::<f32>()
             .map_err(|err| Error::Backend(format!("failed to extract decoder logits: {err}")))?;
+        let logits_dims = logits_shape.as_ref();
+        let Some((&logits_dimension, leading_dimensions)) = logits_dims.split_last() else {
+            return Err(Error::Backend(format!(
+                "decoder returned scalar logits with shape {logits_dims:?}"
+            )));
+        };
+        if leading_dimensions.iter().any(|&dimension| dimension != 1) {
+            return Err(Error::Backend(format!(
+                "decoder logits must contain one prediction, got shape {logits_dims:?}"
+            )));
+        }
+        let logits_size = usize::try_from(logits_dimension).map_err(|_| {
+            Error::Backend(format!(
+                "invalid decoder logits dimension: {logits_dimension}"
+            ))
+        })?;
+        let minimum_logits = vocab_size
+            .checked_add(1)
+            .ok_or_else(|| Error::Backend("decoder logits size overflow".to_string()))?;
+        if logits_size < minimum_logits || logits_data.len() != logits_size {
+            return Err(Error::Backend(format!(
+                "decoder returned {} logits with shape {logits_dims:?}; expected at least {minimum_logits}",
+                logits_data.len()
+            )));
+        }
         let token_id = logits_data
             .iter()
             .take(vocab_size)
@@ -281,10 +327,13 @@ fn greedy_decode(
             .unwrap_or(0);
 
         if token_id != blank_id {
-            copy_state(&outputs["output_states_1"], "output_states_1", &mut state_h)?;
-            copy_state(&outputs["output_states_2"], "output_states_2", &mut state_c)?;
+            let output_state_h = required_output(&outputs, "decoder", "output_states_1")?;
+            let output_state_c = required_output(&outputs, "decoder", "output_states_2")?;
+            copy_state(output_state_h, "output_states_1", &mut state_h)?;
+            copy_state(output_state_c, "output_states_2", &mut state_c)?;
             tokens.push(token_id);
-            last_emitted_token = token_id as i32;
+            last_emitted_token = i32::try_from(token_id)
+                .map_err(|_| Error::Backend("token id exceeds decoder input range".to_string()))?;
             emitted_tokens += 1;
         }
 
@@ -383,36 +432,218 @@ fn cpu_provider() -> ExecutionProviderDispatch {
     ort::ep::CPU::default().build().error_on_failure()
 }
 
-fn encoder_feature_size(encoder: &Session) -> Result<usize> {
-    let Some(input) = encoder
-        .inputs()
-        .iter()
-        .find(|input| input.name() == "audio_signal")
-    else {
-        return Err(Error::ModelLoad(
-            "encoder model is missing audio_signal input".to_string(),
-        ));
-    };
+fn validate_encoder_contract(encoder: &Session) -> Result<EncoderContract> {
+    let audio_shape = require_tensor(
+        encoder.inputs(),
+        "encoder input",
+        "audio_signal",
+        TensorElementType::Float32,
+        Some(3),
+        &[(0, 1)],
+    )?;
+    require_tensor(
+        encoder.inputs(),
+        "encoder input",
+        "length",
+        TensorElementType::Int64,
+        Some(1),
+        &[(0, 1)],
+    )?;
+    let encoded_shape = require_tensor(
+        encoder.outputs(),
+        "encoder output",
+        "outputs",
+        TensorElementType::Float32,
+        Some(3),
+        &[(0, 1)],
+    )?;
+    require_tensor(
+        encoder.outputs(),
+        "encoder output",
+        "encoded_lengths",
+        TensorElementType::Int64,
+        Some(1),
+        &[(0, 1)],
+    )?;
 
-    let ValueType::Tensor { shape, .. } = input.dtype() else {
-        return Err(Error::ModelLoad(format!(
-            "encoder audio_signal input must be a tensor, got {:?}",
-            input.dtype()
-        )));
-    };
+    let feature_size = known_dimension(audio_shape, 1, "encoder audio_signal feature")?
+        .ok_or_else(|| {
+            Error::ModelLoad(format!(
+                "encoder audio_signal feature dimension must be static, got {audio_shape:?}"
+            ))
+        })?;
+    let encoded_size = known_dimension(encoded_shape, 1, "encoder output feature")?;
 
-    let Some(&feature_size) = shape.get(1) else {
-        return Err(Error::ModelLoad(format!(
-            "encoder audio_signal input must be rank 3, got shape {shape:?}"
-        )));
-    };
-    if feature_size <= 0 {
-        return Err(Error::ModelLoad(format!(
-            "encoder audio_signal feature dimension must be static, got shape {shape:?}"
-        )));
+    Ok(EncoderContract {
+        feature_size,
+        encoded_size,
+    })
+}
+
+fn validate_decoder_joint_contract(
+    decoder_joint: &Session,
+    encoder: &EncoderContract,
+    vocab_size: usize,
+) -> Result<()> {
+    let encoder_input_shape = require_tensor(
+        decoder_joint.inputs(),
+        "decoder input",
+        "encoder_outputs",
+        TensorElementType::Float32,
+        Some(3),
+        &[(0, 1), (2, 1)],
+    )?;
+    require_tensor(
+        decoder_joint.inputs(),
+        "decoder input",
+        "targets",
+        TensorElementType::Int32,
+        Some(2),
+        &[(0, 1), (1, 1)],
+    )?;
+    require_tensor(
+        decoder_joint.inputs(),
+        "decoder input",
+        "target_length",
+        TensorElementType::Int32,
+        Some(1),
+        &[(0, 1)],
+    )?;
+    for name in ["input_states_1", "input_states_2"] {
+        require_tensor(
+            decoder_joint.inputs(),
+            "decoder input",
+            name,
+            TensorElementType::Float32,
+            Some(3),
+            &[(0, DECODER_STATE_LAYERS), (1, 1), (2, DECODER_STATE_SIZE)],
+        )?;
     }
 
-    Ok(feature_size as usize)
+    let logits_shape = require_tensor(
+        decoder_joint.outputs(),
+        "decoder output",
+        "outputs",
+        TensorElementType::Float32,
+        None,
+        &[],
+    )?;
+    if logits_shape.is_empty() {
+        return Err(Error::ModelLoad(
+            "decoder output 'outputs' must not be a scalar".to_string(),
+        ));
+    }
+    for index in 0..logits_shape.len() - 1 {
+        require_compatible_dimension(logits_shape, index, 1, "decoder logits")?;
+    }
+    for name in ["output_states_1", "output_states_2"] {
+        require_tensor(
+            decoder_joint.outputs(),
+            "decoder output",
+            name,
+            TensorElementType::Float32,
+            Some(3),
+            &[(0, DECODER_STATE_LAYERS), (1, 1), (2, DECODER_STATE_SIZE)],
+        )?;
+    }
+
+    if let Some(encoded_size) = encoder.encoded_size {
+        require_compatible_dimension(
+            encoder_input_shape,
+            1,
+            encoded_size,
+            "decoder encoder_outputs feature",
+        )?;
+    }
+    if let Some(logits_size) = known_dimension(logits_shape, 3, "decoder logits")? {
+        let minimum_logits = vocab_size
+            .checked_add(1)
+            .ok_or_else(|| Error::ModelLoad("decoder logits size overflow".to_string()))?;
+        if logits_size < minimum_logits {
+            return Err(Error::ModelLoad(format!(
+                "decoder logits dimension {logits_size} is too small for {vocab_size} vocabulary entries and a duration output"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn require_tensor<'a>(
+    outlets: &'a [Outlet],
+    location: &str,
+    name: &str,
+    expected_type: TensorElementType,
+    expected_rank: Option<usize>,
+    expected_dimensions: &[(usize, usize)],
+) -> Result<&'a [i64]> {
+    let outlet = outlets
+        .iter()
+        .find(|outlet| outlet.name() == name)
+        .ok_or_else(|| Error::ModelLoad(format!("{location} is missing '{name}'")))?;
+    let ValueType::Tensor { ty, shape, .. } = outlet.dtype() else {
+        return Err(Error::ModelLoad(format!(
+            "{location} '{name}' must be a tensor, got {}",
+            outlet.dtype()
+        )));
+    };
+    if *ty != expected_type {
+        return Err(Error::ModelLoad(format!(
+            "{location} '{name}' must contain {expected_type}, got {ty}"
+        )));
+    }
+    if let Some(expected_rank) = expected_rank
+        && shape.len() != expected_rank
+    {
+        return Err(Error::ModelLoad(format!(
+            "{location} '{name}' must have rank {expected_rank}, got shape {shape:?}"
+        )));
+    }
+    for &(index, expected) in expected_dimensions {
+        require_compatible_dimension(shape, index, expected, &format!("{location} '{name}'"))?;
+    }
+    Ok(shape.as_ref())
+}
+
+fn known_dimension(shape: &[i64], index: usize, label: &str) -> Result<Option<usize>> {
+    match shape.get(index).copied() {
+        Some(-1) => Ok(None),
+        Some(value) if value > 0 => usize::try_from(value)
+            .map(Some)
+            .map_err(|_| Error::ModelLoad(format!("{label} dimension is too large: {value}"))),
+        Some(value) => Err(Error::ModelLoad(format!(
+            "{label} dimension must be positive or dynamic, got {value}"
+        ))),
+        None => Err(Error::ModelLoad(format!(
+            "{label} dimension is missing from shape {shape:?}"
+        ))),
+    }
+}
+
+fn require_compatible_dimension(
+    shape: &[i64],
+    index: usize,
+    expected: usize,
+    label: &str,
+) -> Result<()> {
+    if let Some(actual) = known_dimension(shape, index, label)?
+        && actual != expected
+    {
+        return Err(Error::ModelLoad(format!(
+            "{label} dimension {actual} does not match required size {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn required_output<'a>(
+    outputs: &'a SessionOutputs<'_>,
+    model: &str,
+    name: &str,
+) -> Result<&'a DynValue> {
+    outputs
+        .get(name)
+        .ok_or_else(|| Error::Backend(format!("{model} returned no '{name}' value")))
 }
 
 fn copy_state(value: &ort::value::Value, name: &str, destination: &mut Array3<f32>) -> Result<()> {
@@ -421,19 +652,23 @@ fn copy_state(value: &ort::value::Value, name: &str, destination: &mut Array3<f3
         .map_err(|err| Error::Backend(format!("failed to extract {name}: {err}")))?;
     let dims = shape.as_ref();
     let expected = destination.shape();
-    if dims.len() != 3
-        || dims[0] as usize != expected[0]
-        || dims[1] as usize != expected[1]
-        || dims[2] as usize != expected[2]
-    {
+    let expected_dims = [expected[0] as i64, expected[1] as i64, expected[2] as i64];
+    if dims != expected_dims {
         return Err(Error::Backend(format!(
             "expected {name} shape {expected:?}, got {dims:?}"
         )));
     }
-    destination
+    let destination = destination
         .as_slice_mut()
-        .expect("decoder state arrays are contiguous")
-        .copy_from_slice(data);
+        .ok_or_else(|| Error::Backend("decoder state array is not contiguous".to_string()))?;
+    if data.len() != destination.len() {
+        return Err(Error::Backend(format!(
+            "{name} contains {} values, expected {}",
+            data.len(),
+            destination.len()
+        )));
+    }
+    destination.copy_from_slice(data);
     Ok(())
 }
 
@@ -478,25 +713,64 @@ fn find_model_file(dir: &Path, candidates: &[&str], label: &str) -> Result<PathB
 fn load_vocab(path: &Path) -> Result<Vec<String>> {
     let file = File::open(path)
         .map_err(|err| Error::ModelLoad(format!("failed to open vocab.txt: {err}")))?;
-    let reader = BufReader::new(file);
-    let mut vocab = Vec::new();
+    parse_vocab(BufReader::new(file))
+}
 
-    for line in reader.lines() {
+fn parse_vocab(reader: impl BufRead) -> Result<Vec<String>> {
+    let mut entries = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
         let line = line.map_err(|err| Error::ModelLoad(format!("failed to read vocab: {err}")))?;
-        let Some((token, id)) = line.rsplit_once(' ') else {
+        if line.is_empty() {
             continue;
-        };
-        let id = id
-            .parse::<usize>()
-            .map_err(|err| Error::ModelLoad(format!("invalid vocab id '{id}': {err}")))?;
-        if id >= vocab.len() {
-            vocab.resize(id + 1, String::new());
         }
-        vocab[id] = token.to_string();
+        let (token, id) = line.rsplit_once(' ').ok_or_else(|| {
+            Error::ModelLoad(format!(
+                "invalid vocab entry on line {line_number}: expected '<token> <id>'"
+            ))
+        })?;
+        if token.is_empty() {
+            return Err(Error::ModelLoad(format!(
+                "invalid empty token on vocab line {line_number}"
+            )));
+        }
+        let id = id.parse::<usize>().map_err(|err| {
+            Error::ModelLoad(format!(
+                "invalid vocab id '{id}' on line {line_number}: {err}"
+            ))
+        })?;
+        entries.push((id, line_number, token.to_string()));
     }
 
-    if vocab.is_empty() {
+    if entries.is_empty() {
         return Err(Error::ModelLoad("vocab.txt is empty".to_string()));
+    }
+    entries.sort_unstable_by_key(|entry| entry.0);
+    for (expected_id, (actual_id, line_number, _)) in entries.iter().enumerate() {
+        if *actual_id < expected_id {
+            return Err(Error::ModelLoad(format!(
+                "duplicate vocab id {actual_id} on line {line_number}"
+            )));
+        }
+        if *actual_id > expected_id {
+            return Err(Error::ModelLoad(format!(
+                "vocab.txt is missing token id {expected_id}"
+            )));
+        }
+    }
+    let vocab = entries
+        .into_iter()
+        .map(|(_, _, token)| token)
+        .collect::<Vec<_>>();
+    if let Some(blank_id) = vocab
+        .iter()
+        .position(|token| matches!(token.as_str(), "<blank>" | "<blk>"))
+        && blank_id + 1 != vocab.len()
+    {
+        return Err(Error::ModelLoad(
+            "the <blank> or <blk> vocab entry must be last".to_string(),
+        ));
     }
     Ok(vocab)
 }
@@ -620,6 +894,23 @@ fn mel_to_hz_slaney(mel: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ort::value::{Shape, SymbolicDimensions};
+    use std::io::Cursor;
+
+    fn parse_test_vocab(contents: &str) -> Result<Vec<String>> {
+        parse_vocab(Cursor::new(contents))
+    }
+
+    fn tensor_outlet(name: &str, ty: TensorElementType, shape: &[i64]) -> Outlet {
+        Outlet::new(
+            name,
+            ValueType::Tensor {
+                ty,
+                shape: Shape::new(shape.iter().copied()),
+                dimension_symbols: SymbolicDimensions::empty(shape.len()),
+            },
+        )
+    }
 
     #[test]
     fn word_boundary_uses_spaces_for_multilingual_vocab() {
@@ -665,6 +956,115 @@ mod tests {
         assert!((features[[0, 1]] - expected).abs() < 1e-5);
         assert_eq!(features[[0, 2]], 0.0);
         assert_eq!(valid_feature_frames(PCM_SAMPLE_RATE_HZ as usize), 100);
+    }
+
+    #[test]
+    fn vocab_requires_contiguous_unique_ids_and_final_blank() {
+        assert_eq!(
+            parse_test_vocab("\ntoken 0\n<blank> 1\n").unwrap(),
+            ["token", "<blank>"]
+        );
+
+        for (contents, expected_message) in [
+            ("token\n<blank> 1\n", "invalid vocab entry"),
+            ("token 0\nother 0\n<blank> 1\n", "duplicate vocab id 0"),
+            ("token 0\n<blank> 2\n", "missing token id 1"),
+            ("<blank> 0\ntoken 1\n", "must be last"),
+        ] {
+            let error = parse_test_vocab(contents).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_message),
+                "unexpected error: {error}"
+            );
+        }
+
+        let huge_id = format!("token {}\n", usize::MAX);
+        assert!(
+            parse_test_vocab(&huge_id)
+                .unwrap_err()
+                .to_string()
+                .contains("missing token id 0")
+        );
+    }
+
+    #[test]
+    fn model_dimensions_accept_dynamic_and_reject_invalid_values() {
+        assert_eq!(known_dimension(&[-1, 80, -1], 0, "test").unwrap(), None);
+        assert_eq!(known_dimension(&[-1, 80, -1], 1, "test").unwrap(), Some(80));
+        assert!(known_dimension(&[-1, 0, -1], 1, "test").is_err());
+        assert!(known_dimension(&[-1, -2, -1], 1, "test").is_err());
+    }
+
+    #[test]
+    fn tensor_contract_checks_name_type_rank_and_static_dimensions() {
+        let valid = [tensor_outlet(
+            "audio_signal",
+            TensorElementType::Float32,
+            &[-1, 80, -1],
+        )];
+        assert_eq!(
+            require_tensor(
+                &valid,
+                "encoder input",
+                "audio_signal",
+                TensorElementType::Float32,
+                Some(3),
+                &[(0, 1)],
+            )
+            .unwrap(),
+            [-1, 80, -1]
+        );
+
+        assert!(
+            require_tensor(
+                &valid,
+                "encoder input",
+                "missing",
+                TensorElementType::Float32,
+                Some(3),
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            require_tensor(
+                &valid,
+                "encoder input",
+                "audio_signal",
+                TensorElementType::Int32,
+                Some(3),
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            require_tensor(
+                &valid,
+                "encoder input",
+                "audio_signal",
+                TensorElementType::Float32,
+                Some(2),
+                &[],
+            )
+            .is_err()
+        );
+
+        let incompatible = [tensor_outlet(
+            "audio_signal",
+            TensorElementType::Float32,
+            &[2, 80, -1],
+        )];
+        assert!(
+            require_tensor(
+                &incompatible,
+                "encoder input",
+                "audio_signal",
+                TensorElementType::Float32,
+                Some(3),
+                &[(0, 1)],
+            )
+            .is_err()
+        );
     }
 
     #[test]
