@@ -47,6 +47,7 @@ async fn main() -> common::ExampleResult<()> {
     let microphone_id = session.input.source_id();
     let system_id = system_input.as_ref().map(|input| input.source_id());
     let (microphone_input, mut events, worker) = session.into_parts();
+    let output_monitor = events.monitor();
 
     let mut captures = vec![microphone_device.start(session_started, microphone_input)?];
     if let (Some(device), Some(input)) = (system_device, system_input) {
@@ -69,8 +70,25 @@ async fn main() -> common::ExampleResult<()> {
     };
     println!("Transcribing {mode}...");
     let mut stopping = false;
+    let mut next_backlog_warning = Some(32_usize);
 
     loop {
+        if let Some(threshold) = next_backlog_warning {
+            let metrics = output_monitor.metrics();
+            if metrics.peak_pending_events >= threshold {
+                eprintln!(
+                    "Warning: transcript output backlog peaked at {} events (currently {} pending)",
+                    metrics.peak_pending_events, metrics.pending_events,
+                );
+
+                next_backlog_warning = threshold.checked_mul(2);
+                while next_backlog_warning.is_some_and(|next| next <= metrics.peak_pending_events) {
+                    next_backlog_warning =
+                        next_backlog_warning.and_then(|next| next.checked_mul(2));
+                }
+            }
+        }
+
         tokio::select! {
             _ = stop_rx.recv(), if !stopping => {
                 stopping = true;
@@ -97,6 +115,15 @@ async fn main() -> common::ExampleResult<()> {
         capture.join()?;
     }
     worker.await?;
+    let metrics = output_monitor.metrics();
+    println!(
+        "Output stats: emitted={}, received={}, peak_pending={}, discarded={}, delivery_failures={}",
+        metrics.emitted_events,
+        metrics.received_events,
+        metrics.peak_pending_events,
+        metrics.discarded_events,
+        metrics.delivery_failures,
+    );
     println!("Stopped.");
 
     Ok(())

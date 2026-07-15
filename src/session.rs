@@ -3,12 +3,280 @@ use crate::backend::AsrModel;
 use crate::event::{SegmentId, TranscriptEvent, TranscriptSegment};
 use crate::vad::{SpeechChunk, VadFactory, VadGate, duration_from_samples};
 use crate::{AudioSourceId, Error, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Join handle for the blocking transcription worker.
 pub type TranscriptionWorker = JoinHandle<()>;
+
+/// A point-in-time snapshot of transcript output delivery statistics.
+///
+/// All transcript segments, terminal errors, and end-of-stream markers count
+/// as events. Counters saturate instead of wrapping when their numeric range is
+/// exhausted.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputMetrics {
+    /// Events currently waiting to be received.
+    pub pending_events: usize,
+    /// Largest observed number of simultaneously pending events.
+    pub peak_pending_events: usize,
+    /// Events successfully added to the output queue.
+    pub emitted_events: u64,
+    /// Events returned through the receiver API.
+    pub received_events: u64,
+    /// Queued events abandoned when the receiver was dropped.
+    pub discarded_events: u64,
+    /// Event delivery attempts rejected after the receiver closed.
+    pub delivery_failures: u64,
+    /// Whether the consumer explicitly closed or dropped the receiver.
+    pub receiver_closed: bool,
+}
+
+#[derive(Debug, Default)]
+struct OutputCounters {
+    pending_events: usize,
+    peak_pending_events: usize,
+    emitted_events: u64,
+    received_events: u64,
+    discarded_events: u64,
+    delivery_failures: u64,
+    receiver_closed: bool,
+}
+
+#[derive(Debug, Default)]
+struct OutputState {
+    counters: Mutex<OutputCounters>,
+}
+
+impl OutputState {
+    fn lock(&self) -> MutexGuard<'_, OutputCounters> {
+        self.counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn metrics(&self) -> OutputMetrics {
+        let counters = self.lock();
+        OutputMetrics {
+            pending_events: counters.pending_events,
+            peak_pending_events: counters.peak_pending_events,
+            emitted_events: counters.emitted_events,
+            received_events: counters.received_events,
+            discarded_events: counters.discarded_events,
+            delivery_failures: counters.delivery_failures,
+            receiver_closed: counters.receiver_closed,
+        }
+    }
+
+    fn record_received(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut counters = self.lock();
+        counters.pending_events = counters.pending_events.saturating_sub(count);
+        counters.received_events = counters.received_events.saturating_add(count as u64);
+    }
+
+    fn record_discarded(&self, count: usize) {
+        let mut counters = self.lock();
+        counters.receiver_closed = true;
+        counters.pending_events = counters.pending_events.saturating_sub(count);
+        counters.discarded_events = counters.discarded_events.saturating_add(count as u64);
+    }
+
+    fn record_receiver_closed(&self) {
+        self.lock().receiver_closed = true;
+    }
+}
+
+/// Cloneable observer for transcript output delivery statistics.
+///
+/// A monitor only retains the metrics state. It does not keep the event queue,
+/// audio inputs, or transcription worker alive.
+#[derive(Clone, Debug)]
+pub struct OutputMonitor {
+    state: Arc<OutputState>,
+}
+
+impl OutputMonitor {
+    /// Return the latest output delivery statistics.
+    pub fn metrics(&self) -> OutputMetrics {
+        self.state.metrics()
+    }
+}
+
+/// Receiver for transcript events produced by a transcription session.
+///
+/// Output remains unbounded so closing audio inputs never depends on draining
+/// this receiver concurrently. Applications should use [`Self::monitor`] to
+/// detect a growing backlog and continuously drain long-running sessions.
+pub struct TranscriptEventReceiver {
+    inner: mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
+    monitor: OutputMonitor,
+    cancelled: Arc<AtomicBool>,
+    commands: mpsc::WeakSender<SessionCommand>,
+}
+
+impl TranscriptEventReceiver {
+    fn new(
+        inner: mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
+        state: Arc<OutputState>,
+        cancelled: Arc<AtomicBool>,
+        commands: mpsc::WeakSender<SessionCommand>,
+    ) -> Self {
+        Self {
+            inner,
+            monitor: OutputMonitor { state },
+            cancelled,
+            commands,
+        }
+    }
+
+    /// Receive the next transcript event, waiting if necessary.
+    pub async fn recv(&mut self) -> Option<Result<TranscriptEvent>> {
+        let event = self.inner.recv().await;
+        self.record_one(&event);
+        event
+    }
+
+    /// Receive up to `limit` transcript events into `buffer`.
+    pub async fn recv_many(
+        &mut self,
+        buffer: &mut Vec<Result<TranscriptEvent>>,
+        limit: usize,
+    ) -> usize {
+        let count = self.inner.recv_many(buffer, limit).await;
+        self.monitor.state.record_received(count);
+        count
+    }
+
+    /// Try to receive the next transcript event without waiting.
+    pub fn try_recv(
+        &mut self,
+    ) -> std::result::Result<Result<TranscriptEvent>, mpsc::error::TryRecvError> {
+        let result = self.inner.try_recv();
+        if result.is_ok() {
+            self.monitor.state.record_received(1);
+        }
+        result
+    }
+
+    /// Receive the next transcript event from a synchronous context.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from an asynchronous execution context.
+    pub fn blocking_recv(&mut self) -> Option<Result<TranscriptEvent>> {
+        let event = self.inner.blocking_recv();
+        self.record_one(&event);
+        event
+    }
+
+    /// Receive up to `limit` transcript events from a synchronous context.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from an asynchronous execution context.
+    pub fn blocking_recv_many(
+        &mut self,
+        buffer: &mut Vec<Result<TranscriptEvent>>,
+        limit: usize,
+    ) -> usize {
+        let count = self.inner.blocking_recv_many(buffer, limit);
+        self.monitor.state.record_received(count);
+        count
+    }
+
+    /// Poll for the next transcript event.
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<TranscriptEvent>>> {
+        let event = self.inner.poll_recv(cx);
+        if matches!(&event, Poll::Ready(Some(_))) {
+            self.monitor.state.record_received(1);
+        }
+        event
+    }
+
+    /// Poll for up to `limit` transcript events, extending `buffer`.
+    pub fn poll_recv_many(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &mut Vec<Result<TranscriptEvent>>,
+        limit: usize,
+    ) -> Poll<usize> {
+        let result = self.inner.poll_recv_many(cx, buffer, limit);
+        if let Poll::Ready(count) = result {
+            self.monitor.state.record_received(count);
+        }
+        result
+    }
+
+    /// Stop new output and cancel the worker while retaining queued events.
+    ///
+    /// Call [`Self::recv`] until it returns `None` to drain events that were
+    /// already queued when the receiver closed.
+    pub fn close(&mut self) {
+        self.inner.close();
+        self.monitor.state.record_receiver_closed();
+        self.cancel_worker();
+    }
+
+    /// Return the number of events currently waiting to be received.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Return whether no events are currently waiting to be received.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Return whether the output channel is closed to new events.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Return the latest output delivery statistics.
+    pub fn metrics(&self) -> OutputMetrics {
+        self.monitor.metrics()
+    }
+
+    /// Create an observer that can inspect statistics from another task.
+    pub fn monitor(&self) -> OutputMonitor {
+        self.monitor.clone()
+    }
+
+    fn record_one(&self, event: &Option<Result<TranscriptEvent>>) {
+        if event.is_some() {
+            self.monitor.state.record_received(1);
+        }
+    }
+
+    fn cancel_worker(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel)
+            && let Some(commands) = self.commands.upgrade()
+        {
+            let _ = commands.try_send(SessionCommand::Cancel);
+        }
+    }
+}
+
+impl Drop for TranscriptEventReceiver {
+    fn drop(&mut self) {
+        self.inner.close();
+        self.cancel_worker();
+
+        let mut discarded = 0usize;
+        while self.inner.try_recv().is_ok() {
+            discarded = discarded.saturating_add(1);
+        }
+        self.monitor.state.record_discarded(discarded);
+    }
+}
 
 /// Input handle for one registered audio source.
 ///
@@ -20,14 +288,20 @@ pub type TranscriptionWorker = JoinHandle<()>;
 pub struct AudioInput {
     source_id: AudioSourceId,
     commands: mpsc::Sender<SessionCommand>,
+    cancelled: Arc<AtomicBool>,
     closed: bool,
 }
 
 impl AudioInput {
-    pub(crate) fn new(source_id: AudioSourceId, commands: mpsc::Sender<SessionCommand>) -> Self {
+    pub(crate) fn new(
+        source_id: AudioSourceId,
+        commands: mpsc::Sender<SessionCommand>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             source_id,
             commands,
+            cancelled,
             closed: false,
         }
     }
@@ -58,6 +332,7 @@ impl AudioInput {
     }
 
     async fn send_command(&self, timestamp: Option<Duration>, samples: Vec<f32>) -> Result<()> {
+        self.ensure_active()?;
         self.commands
             .send(SessionCommand::Audio {
                 source_id: self.source_id,
@@ -65,7 +340,8 @@ impl AudioInput {
                 samples,
             })
             .await
-            .map_err(|_| Error::StreamClosed)
+            .map_err(|_| Error::StreamClosed)?;
+        self.ensure_active()
     }
 
     /// Send one f32 mono 16 kHz PCM chunk from a non-async capture thread.
@@ -90,18 +366,21 @@ impl AudioInput {
     }
 
     fn blocking_send_command(&self, timestamp: Option<Duration>, samples: Vec<f32>) -> Result<()> {
+        self.ensure_active()?;
         self.commands
             .blocking_send(SessionCommand::Audio {
                 source_id: self.source_id,
                 timestamp,
                 samples,
             })
-            .map_err(|_| Error::StreamClosed)
+            .map_err(|_| Error::StreamClosed)?;
+        self.ensure_active()
     }
 
     /// Finish and release this source after emitting any buffered segment.
     ///
     pub async fn close(mut self) -> Result<()> {
+        self.ensure_active()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(SessionCommand::CloseSource {
@@ -120,6 +399,7 @@ impl AudioInput {
     ///
     /// Panics when called from an asynchronous execution context.
     pub fn blocking_close(mut self) -> Result<()> {
+        self.ensure_active()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .blocking_send(SessionCommand::CloseSource {
@@ -130,11 +410,19 @@ impl AudioInput {
         self.closed = true;
         reply_rx.blocking_recv().map_err(|_| Error::StreamClosed)?
     }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(Error::StreamClosed)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for AudioInput {
     fn drop(&mut self) {
-        if !self.closed {
+        if !self.closed && !self.cancelled.load(Ordering::Acquire) {
             let _ = self.commands.try_send(SessionCommand::CloseSource {
                 source_id: self.source_id,
                 reply: None,
@@ -151,9 +439,10 @@ pub struct TranscriptionSession {
     ///
     /// After an error, the worker closes the event channel without emitting
     /// `TranscriptEvent::EndOfStream`.
-    pub events: mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
+    pub events: TranscriptEventReceiver,
     pub(crate) commands: mpsc::Sender<SessionCommand>,
     pub(crate) worker: TranscriptionWorker,
+    pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 impl TranscriptionSession {
@@ -162,28 +451,33 @@ impl TranscriptionSession {
     /// This waits for the source's VAD session to initialize. Closing a source
     /// releases its state and makes its capacity available to another source.
     pub async fn open_source(&self) -> Result<AudioInput> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(Error::StreamClosed);
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(SessionCommand::OpenSource { reply: reply_tx })
             .await
             .map_err(|_| Error::StreamClosed)?;
         let source_id = reply_rx.await.map_err(|_| Error::StreamClosed)??;
-        Ok(AudioInput::new(source_id, self.commands.clone()))
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(Error::StreamClosed);
+        }
+        Ok(AudioInput::new(
+            source_id,
+            self.commands.clone(),
+            Arc::clone(&self.cancelled),
+        ))
     }
 
     /// Split the session into primary input, output, and worker handle.
-    pub fn into_parts(
-        self,
-    ) -> (
-        AudioInput,
-        mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
-        TranscriptionWorker,
-    ) {
+    pub fn into_parts(self) -> (AudioInput, TranscriptEventReceiver, TranscriptionWorker) {
         (self.input, self.events, self.worker)
     }
 }
 
 pub(crate) enum SessionCommand {
+    Cancel,
     OpenSource {
         reply: oneshot::Sender<Result<AudioSourceId>>,
     },
@@ -198,13 +492,56 @@ pub(crate) enum SessionCommand {
     },
 }
 
+pub(crate) struct EventSender {
+    inner: mpsc::UnboundedSender<Result<TranscriptEvent>>,
+    state: Arc<OutputState>,
+}
+
+impl EventSender {
+    fn send(&self, event: Result<TranscriptEvent>) -> Result<()> {
+        // Hold the accounting lock across the non-blocking send so a receiver
+        // cannot permanently decrement pending before this send increments it.
+        let mut counters = self.state.lock();
+        match self.inner.send(event) {
+            Ok(()) => {
+                counters.pending_events = counters.pending_events.saturating_add(1);
+                counters.peak_pending_events =
+                    counters.peak_pending_events.max(counters.pending_events);
+                counters.emitted_events = counters.emitted_events.saturating_add(1);
+                Ok(())
+            }
+            Err(_) => {
+                counters.delivery_failures = counters.delivery_failures.saturating_add(1);
+                Err(Error::StreamClosed)
+            }
+        }
+    }
+}
+
+pub(crate) fn output_channel(
+    commands: mpsc::WeakSender<SessionCommand>,
+) -> (EventSender, TranscriptEventReceiver, Arc<AtomicBool>) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let state = Arc::new(OutputState::default());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    (
+        EventSender {
+            inner: event_tx,
+            state: Arc::clone(&state),
+        },
+        TranscriptEventReceiver::new(event_rx, state, Arc::clone(&cancelled), commands),
+        cancelled,
+    )
+}
+
 pub(crate) fn run_transcription_worker(
     max_sources: usize,
     mut model: Box<dyn AsrModel>,
     primary_vad: Box<dyn VadGate>,
     mut vad_factory: Box<dyn VadFactory>,
     mut command_rx: mpsc::Receiver<SessionCommand>,
-    event_tx: mpsc::UnboundedSender<Result<TranscriptEvent>>,
+    event_tx: EventSender,
+    cancelled: Arc<AtomicBool>,
 ) {
     let mut next_segment_id = 0u64;
     let mut next_source_id = 1u64;
@@ -217,8 +554,21 @@ pub(crate) fn run_transcription_worker(
         },
     )];
 
-    while let Some(command) = command_rx.blocking_recv() {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(command) = command_rx.blocking_recv() else {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            break;
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
         match command {
+            SessionCommand::Cancel => return,
             SessionCommand::OpenSource { reply } => {
                 if sources.len() >= max_sources {
                     let _ = reply.send(Err(Error::SourceLimit { max_sources }));
@@ -232,6 +582,9 @@ pub(crate) fn run_transcription_worker(
                         continue;
                     }
                 };
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 let source_id = AudioSourceId::new(next_source_id);
                 next_source_id = match next_source_id.checked_add(1) {
                     Some(value) => value,
@@ -270,15 +623,20 @@ pub(crate) fn run_transcription_worker(
                 let mut sink = EventSink {
                     event_tx: &event_tx,
                     next_segment_id: &mut next_segment_id,
+                    cancelled: cancelled.as_ref(),
                 };
-                if let Err(err) = process_chunk(
+                let result = process_chunk(
                     model.as_mut(),
                     source,
                     &mut sink,
                     source_id,
                     timestamp,
                     samples,
-                ) {
+                );
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Err(err) = result {
                     fail(&event_tx, err);
                     return;
                 }
@@ -295,8 +653,12 @@ pub(crate) fn run_transcription_worker(
                 let mut sink = EventSink {
                     event_tx: &event_tx,
                     next_segment_id: &mut next_segment_id,
+                    cancelled: cancelled.as_ref(),
                 };
                 let result = finish_source(model.as_mut(), source, &mut sink, source_id);
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(reply) = reply {
                     let _ = reply.send(result.clone());
                 }
@@ -312,10 +674,17 @@ pub(crate) fn run_transcription_worker(
         }
     }
 
+    if cancelled.load(Ordering::Acquire) {
+        return;
+    }
     for (source_id, source) in sources {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let mut sink = EventSink {
             event_tx: &event_tx,
             next_segment_id: &mut next_segment_id,
+            cancelled: cancelled.as_ref(),
         };
         if let Err(err) = finish_source(model.as_mut(), source, &mut sink, source_id) {
             fail(&event_tx, err);
@@ -332,8 +701,9 @@ struct SourceState {
 }
 
 struct EventSink<'a> {
-    event_tx: &'a mpsc::UnboundedSender<Result<TranscriptEvent>>,
+    event_tx: &'a EventSender,
     next_segment_id: &'a mut u64,
+    cancelled: &'a AtomicBool,
 }
 
 fn resolve_timeline_offset(
@@ -416,7 +786,13 @@ fn finish_source(
     sink: &mut EventSink<'_>,
     source_id: AudioSourceId,
 ) -> Result<()> {
+    if sink.cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let final_chunks = source.vad.finish()?;
+    if sink.cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let timeline_offset_sample = source.timeline_offset_sample.unwrap_or(0);
     handle_speech_chunks(model, sink, source_id, timeline_offset_sample, final_chunks)
 }
@@ -429,11 +805,17 @@ fn handle_speech_chunks(
     chunks: Vec<SpeechChunk>,
 ) -> Result<()> {
     for speech in chunks {
+        if sink.cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if speech.samples.is_empty() {
             continue;
         }
         let started = Instant::now();
         let text = model.transcribe(speech.samples)?;
+        if sink.cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if text.trim().is_empty() {
             continue;
         }
@@ -478,13 +860,208 @@ fn send_transcript(
     )
 }
 
-fn send_event(
-    event_tx: &mpsc::UnboundedSender<Result<TranscriptEvent>>,
-    event: Result<TranscriptEvent>,
-) -> Result<()> {
-    event_tx.send(event).map_err(|_| Error::StreamClosed)
+fn send_event(event_tx: &EventSender, event: Result<TranscriptEvent>) -> Result<()> {
+    event_tx.send(event)
 }
 
-fn fail(event_tx: &mpsc::UnboundedSender<Result<TranscriptEvent>>, err: Error) {
+fn fail(event_tx: &EventSender, err: Error) {
     let _ = send_event(event_tx, Err(err));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+
+    fn test_output_channel() -> (
+        EventSender,
+        TranscriptEventReceiver,
+        OutputMonitor,
+        mpsc::Sender<SessionCommand>,
+    ) {
+        let (command_tx, _command_rx) = mpsc::channel(4);
+        let (event_tx, events, _cancelled) = output_channel(command_tx.downgrade());
+        let monitor = events.monitor();
+        (event_tx, events, monitor, command_tx)
+    }
+
+    fn end_event() -> Result<TranscriptEvent> {
+        Ok(TranscriptEvent::EndOfStream)
+    }
+
+    #[tokio::test]
+    async fn receiver_metrics_track_async_receive_paths() {
+        let (event_tx, mut events, monitor, _command_tx) = test_output_channel();
+        for _ in 0..6 {
+            event_tx.send(end_event()).unwrap();
+        }
+        event_tx
+            .send(Err(Error::Backend("test failure".to_string())))
+            .unwrap();
+
+        assert_eq!(
+            monitor.metrics(),
+            OutputMetrics {
+                pending_events: 7,
+                peak_pending_events: 7,
+                emitted_events: 7,
+                received_events: 0,
+                discarded_events: 0,
+                delivery_failures: 0,
+                receiver_closed: false,
+            }
+        );
+
+        assert!(events.recv().await.unwrap().is_ok());
+        assert!(events.try_recv().unwrap().is_ok());
+
+        let mut received = Vec::new();
+        assert_eq!(events.recv_many(&mut received, 2).await, 2);
+        assert_eq!(received.len(), 2);
+
+        assert!(poll_fn(|cx| events.poll_recv(cx)).await.unwrap().is_ok());
+        assert_eq!(
+            poll_fn(|cx| events.poll_recv_many(cx, &mut received, 2)).await,
+            2
+        );
+        assert_eq!(received.len(), 4);
+        assert!(matches!(
+            received.last(),
+            Some(Err(Error::Backend(message))) if message == "test failure"
+        ));
+
+        let metrics = events.metrics();
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.peak_pending_events, 7);
+        assert_eq!(metrics.emitted_events, 7);
+        assert_eq!(metrics.received_events, 7);
+        assert_eq!(metrics.discarded_events, 0);
+        assert_eq!(metrics.delivery_failures, 0);
+        assert!(!metrics.receiver_closed);
+    }
+
+    #[test]
+    fn receiver_metrics_track_blocking_receive_paths() {
+        let (event_tx, mut events, monitor, _command_tx) = test_output_channel();
+        for _ in 0..3 {
+            event_tx.send(end_event()).unwrap();
+        }
+
+        assert!(events.blocking_recv().unwrap().is_ok());
+        let mut received = Vec::new();
+        assert_eq!(events.blocking_recv_many(&mut received, 2), 2);
+
+        let metrics = monitor.metrics();
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.received_events, 3);
+        assert_eq!(metrics.peak_pending_events, 3);
+    }
+
+    #[tokio::test]
+    async fn closing_receiver_cancels_output_but_keeps_queued_events() {
+        let (event_tx, mut events, monitor, _command_tx) = test_output_channel();
+        event_tx.send(end_event()).unwrap();
+        event_tx.send(end_event()).unwrap();
+
+        events.close();
+        assert!(event_tx.send(end_event()).is_err());
+
+        let mut received = Vec::new();
+        assert_eq!(events.recv_many(&mut received, 8).await, 2);
+        assert_eq!(events.recv().await, None);
+
+        let metrics = monitor.metrics();
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.emitted_events, 2);
+        assert_eq!(metrics.received_events, 2);
+        assert_eq!(metrics.discarded_events, 0);
+        assert_eq!(metrics.delivery_failures, 1);
+        assert!(metrics.receiver_closed);
+    }
+
+    #[test]
+    fn dropping_receiver_counts_discarded_events() {
+        let (event_tx, events, monitor, _command_tx) = test_output_channel();
+        event_tx.send(end_event()).unwrap();
+        event_tx.send(end_event()).unwrap();
+
+        drop(events);
+        assert!(event_tx.send(end_event()).is_err());
+
+        let metrics = monitor.metrics();
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.peak_pending_events, 2);
+        assert_eq!(metrics.emitted_events, 2);
+        assert_eq!(metrics.received_events, 0);
+        assert_eq!(metrics.discarded_events, 2);
+        assert_eq!(metrics.delivery_failures, 1);
+        assert!(metrics.receiver_closed);
+    }
+
+    #[test]
+    fn output_metrics_counters_saturate_instead_of_wrapping() {
+        let (event_tx, mut events, monitor, _command_tx) = test_output_channel();
+        {
+            let mut counters = monitor.state.lock();
+            counters.pending_events = usize::MAX;
+            counters.peak_pending_events = usize::MAX;
+            counters.emitted_events = u64::MAX;
+            counters.received_events = u64::MAX;
+            counters.discarded_events = u64::MAX;
+            counters.delivery_failures = u64::MAX;
+        }
+
+        event_tx.send(end_event()).unwrap();
+        assert!(events.try_recv().unwrap().is_ok());
+        events.close();
+        assert!(event_tx.send(end_event()).is_err());
+        drop(events);
+
+        let metrics = monitor.metrics();
+        assert_eq!(metrics.pending_events, usize::MAX - 1);
+        assert_eq!(metrics.peak_pending_events, usize::MAX);
+        assert_eq!(metrics.emitted_events, u64::MAX);
+        assert_eq!(metrics.received_events, u64::MAX);
+        assert_eq!(metrics.discarded_events, u64::MAX);
+        assert_eq!(metrics.delivery_failures, u64::MAX);
+        assert!(metrics.receiver_closed);
+    }
+
+    #[test]
+    fn concurrent_send_and_receive_keep_metrics_consistent() {
+        const EVENT_COUNT: usize = 10_000;
+
+        let (event_tx, mut events, monitor, _command_tx) = test_output_channel();
+        let sender = std::thread::spawn(move || {
+            for _ in 0..EVENT_COUNT {
+                event_tx.send(end_event()).unwrap();
+            }
+        });
+
+        for _ in 0..EVENT_COUNT {
+            assert!(events.blocking_recv().unwrap().is_ok());
+        }
+        sender.join().unwrap();
+
+        let metrics = monitor.metrics();
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.emitted_events, EVENT_COUNT as u64);
+        assert_eq!(metrics.received_events, EVENT_COUNT as u64);
+        assert!(metrics.peak_pending_events >= 1);
+        assert_eq!(metrics.delivery_failures, 0);
+    }
+
+    #[test]
+    fn receiver_and_monitor_do_not_add_strong_command_senders() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        assert_eq!(command_tx.strong_count(), 1);
+
+        let (_event_tx, events, _cancelled) = output_channel(command_tx.downgrade());
+        let monitor = events.monitor();
+        assert_eq!(command_tx.strong_count(), 1);
+
+        drop(events);
+        drop(monitor);
+        assert_eq!(command_tx.strong_count(), 1);
+    }
 }

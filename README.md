@@ -16,6 +16,8 @@ Silero VAD and local Parakeet TDT ONNX models.
 - Supports multiple independent audio sources with one shared ASR model and
   one shared Silero model session.
 - Preserves source identifiers and timestamps on a shared session timeline.
+- Exposes transcript-output backlog and delivery metrics for long-running
+  sessions.
 - Supports CPU execution plus opt-in ONNX Runtime acceleration providers.
 - Optionally serializes transcript events for Tauri or other UI layers.
 
@@ -37,14 +39,28 @@ one Windows implementation of that layer.
 
 ```toml
 [dependencies]
-yamabiko-asr = "0.2"
+yamabiko-asr = "0.3"
 ```
 
 Enable only the optional features your application uses. For example:
 
 ```toml
-yamabiko-asr = { version = "0.2", features = ["serde", "directml"] }
+yamabiko-asr = { version = "0.3", features = ["serde", "directml"] }
 ```
+
+## Upgrading from 0.2
+
+Update the dependency requirement to `yamabiko-asr = "0.3"`. The unused
+`Language` type, `Error::InvalidLanguageHint`, `TranscriberBuilder::language`,
+and `language_hint` methods have been removed. Delete language imports and
+builder calls; transcription language is determined by the loaded Parakeet
+model.
+
+`TranscriptionSession::events` and the event value returned by `into_parts()`
+are now `TranscriptEventReceiver` rather than Tokio's
+`UnboundedReceiver`. Common receive operations such as `recv`, `try_recv`, and
+`blocking_recv` remain available. Code that names or extracts the concrete
+Tokio receiver type must use `TranscriptEventReceiver` instead.
 
 ## Model setup
 
@@ -182,6 +198,56 @@ With the `serde` feature enabled, `TranscriptEvent` and `TranscriptSegment`
 implement `Serialize` directly. Duration fields are serialized as `start_ms`,
 `end_ms`, and `inference_ms`, so a separate UI payload type is unnecessary.
 
+### Output monitoring and cancellation
+
+`TranscriptEventReceiver::monitor` returns a cloneable `OutputMonitor`. Its
+snapshots remain available after the receiver has moved to another task, and
+the monitor itself does not keep the receiver, input, or worker alive.
+
+```rust
+use yamabiko_asr::{Error, TranscriptEvent, Transcriber};
+
+async fn transcribe_with_metrics(pcm: Vec<f32>) -> yamabiko_asr::Result<()> {
+    let transcriber = Transcriber::builder("path/to/parakeet-tdt-model").build()?;
+    let (input, mut events, worker) = transcriber.start().into_parts();
+    let monitor = events.monitor();
+
+    input.send(pcm).await?;
+    input.close().await?;
+
+    while let Some(event) = events.recv().await {
+        if matches!(event?, TranscriptEvent::EndOfStream) {
+            break;
+        }
+    }
+
+    worker.await.map_err(|_| Error::StreamClosed)?;
+    let metrics = monitor.metrics();
+    println!(
+        "emitted={}, received={}, peak_pending={}, discarded={}, delivery_failures={}",
+        metrics.emitted_events,
+        metrics.received_events,
+        metrics.peak_pending_events,
+        metrics.discarded_events,
+        metrics.delivery_failures,
+    );
+    Ok(())
+}
+```
+
+`OutputMetrics` also reports the current `pending_events` count and whether the
+receiver was explicitly closed or dropped. This `receiver_closed` flag is
+separate from `TranscriptEventReceiver::is_closed()`, which also becomes true
+when the worker finishes naturally. Calling `TranscriptEventReceiver::close`
+cancels new work and delivery while allowing already queued events to be
+drained. Dropping the receiver cancels the worker and counts queued events as
+discarded. An in-flight synchronous inference operation finishes before
+cancellation takes effect, so join the worker when orderly shutdown matters.
+
+Transcript delivery remains unbounded and lossless during normal operation.
+Monitoring exposes a growing backlog but does not impose a capacity limit;
+long-running applications must continue draining events promptly.
+
 ## Cargo features
 
 | Feature | Purpose |
@@ -242,14 +308,19 @@ cargo run --features directml --example audio_input -- --device directml .\model
 The examples also accept `--vad-threshold`, `--vad-min-speech-ms`,
 `--vad-min-silence-ms`, and `--vad-speech-pad-ms`.
 
+`audio_input` monitors the output queue during capture. It warns when the
+pending backlog reaches 32 events and then at doubled thresholds, and prints
+emitted, received, peak-pending, discarded, and delivery-failure totals during
+normal shutdown. `audio_file` remains the minimal `recv`-loop example.
+
 ## Known limitations and roadmap
 
 - The current supported platform is Windows.
 - The public PCM boundary is fixed to f32 mono 16 kHz.
 - The Japanese Parakeet TDT-CTC model is the currently verified model path;
   multilingual support remains experimental.
-- Events contain VAD-final utterances; partial transcript updates are not
-  emitted yet.
+- Events intentionally contain only VAD-final utterances. Partial transcript
+  updates are outside the scope of 0.3.0.
 - Speaker diarization and speaker identification are planned but not
   implemented.
 - Long-running microphone/system clock-drift correction is planned but not
@@ -257,7 +328,7 @@ The examples also accept `--vad-threshold`, `--vad-min-speech-ms`,
 - Multiple sources share one ASR model and are processed sequentially rather
   than inferred in parallel.
 - Transcript events use an unbounded channel. Long-running applications should
-  drain events continuously.
+  monitor the backlog and drain events continuously.
 
 ## License
 
