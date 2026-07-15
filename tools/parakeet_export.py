@@ -15,10 +15,8 @@ from __future__ import annotations
 
 import argparse
 import functools
-import inspect
 import os
 import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,18 +106,8 @@ def export_raw(model, raw_dir: Path) -> None:
     raw_dir.mkdir(parents=True, exist_ok=True)
     output = raw_dir / "model.onnx"
     try:
-        parameters = inspect.signature(model.export).parameters.values()
-    except (TypeError, ValueError):
-        parameters = ()
-
-    accepts_check_trace = any(
-        parameter.name == "check_trace"
-        or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
-    if accepts_check_trace:
         model.export(output=str(output), check_trace=False)
-    else:
+    except TypeError:
         model.export(output=str(output))
 
 
@@ -186,19 +174,10 @@ def tokenizer_pieces(model) -> list[str]:
         if hasattr(candidate, "vocab"):
             vocab = getattr(candidate, "vocab")
             if isinstance(vocab, dict):
-                ids = list(vocab.values())
-                if (
-                    any(not isinstance(index, int) or isinstance(index, bool) for index in ids)
-                    or len(set(ids)) != len(ids)
-                    or sorted(ids) != list(range(len(ids)))
-                ):
-                    raise RuntimeError(
-                        "Tokenizer vocabulary IDs must be unique and contiguous from zero"
-                    )
-                pieces = [""] * len(vocab)
-                for token, index in vocab.items():
-                    pieces[index] = str(token)
-                return pieces
+                return [
+                    token
+                    for token, _ in sorted(vocab.items(), key=lambda item: item[1])
+                ]
             if isinstance(vocab, list):
                 return [str(token) for token in vocab]
 
@@ -208,38 +187,20 @@ def tokenizer_pieces(model) -> list[str]:
 def decoder_vocab_size(model) -> int | None:
     decoder = getattr(model, "decoder", None)
     value = getattr(decoder, "vocab_size", None)
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+    if isinstance(value, int):
         return value
     return None
 
 
 def write_vocab(model, dest: Path) -> None:
     pieces = tokenizer_pieces(model)
-    if not pieces:
-        raise RuntimeError("Tokenizer vocabulary is empty")
-    if any(not piece or "\n" in piece or "\r" in piece for piece in pieces):
-        raise RuntimeError("Tokenizer vocabulary contains an empty or multiline token")
-
-    blank_markers = {"<blank>", "<blk>"}
-    blank_positions = [
-        index for index, piece in enumerate(pieces) if piece in blank_markers
-    ]
-    if blank_positions and blank_positions != [len(pieces) - 1]:
-        raise RuntimeError("Tokenizer blank token must appear exactly once as the final ID")
 
     # NeMo transducer decoders commonly use blank_id == tokenizer vocab size.
     # This crate expects the blank as the final vocabulary row.
-    vocab_size = decoder_vocab_size(model)
-    if not blank_positions:
-        if vocab_size is not None and vocab_size not in {len(pieces), len(pieces) + 1}:
-            raise RuntimeError(
-                "Decoder vocabulary size does not match the tokenizer vocabulary"
-            )
-        pieces.append("<blank>")
-    elif vocab_size is not None and vocab_size not in {len(pieces) - 1, len(pieces)}:
-        raise RuntimeError(
-            "Decoder vocabulary size does not match the tokenizer vocabulary"
-        )
+    if pieces and pieces[-1] not in {"<blank>", "<blk>"}:
+        vocab_size = decoder_vocab_size(model)
+        if vocab_size is None or vocab_size == len(pieces):
+            pieces.append("<blank>")
 
     with dest.open("w", encoding="utf-8", newline="\n") as handle:
         for index, piece in enumerate(pieces):
@@ -265,7 +226,8 @@ def write_model_source(
 def run_export(defaults: ExportDefaults) -> None:
     args = parse_args(defaults)
     output_dir = args.output_dir.resolve()
-    work_root = args.work_dir.resolve()
+    work_dir = args.work_dir.resolve()
+    raw_dir = work_dir / "raw"
 
     configure_local_caches(output_dir)
     patch_torch_onnx_export()
@@ -273,42 +235,33 @@ def run_export(defaults: ExportDefaults) -> None:
     print(f"Loading model: {args.model}")
     model = load_model(args.model)
 
-    work_root.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix="yamabiko-parakeet-export-", dir=work_root))
-    raw_dir = run_dir / "raw"
-    try:
-        if output_dir == run_dir or run_dir in output_dir.parents:
-            raise RuntimeError("Output directory must not be inside temporary export data")
+    if raw_dir.exists():
+        shutil.rmtree(raw_dir)
+    print(f"Exporting raw ONNX files: {raw_dir}")
+    export_raw(model, raw_dir)
 
-        print(f"Exporting raw ONNX files: {raw_dir}")
-        export_raw(model, raw_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    encoder = find_single(raw_dir, "encoder*.onnx", "*encoder*.onnx")
+    decoder_joint = find_single(
+        raw_dir,
+        "decoder_joint*.onnx",
+        "*decoder_joint*.onnx",
+        "*joint*.onnx",
+    )
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        encoder = find_single(raw_dir, "encoder*.onnx", "*encoder*.onnx")
-        decoder_joint = find_single(
-            raw_dir,
-            "decoder_joint*.onnx",
-            "*decoder_joint*.onnx",
-            "*joint*.onnx",
-        )
+    print("Writing local ONNX model layout")
+    save_external_data_onnx(encoder, output_dir / "encoder.onnx", "encoder.onnx.data")
+    save_single_file_onnx(decoder_joint, output_dir / "decoder_joint.onnx")
+    write_vocab(model, output_dir / "vocab.txt")
+    write_model_source(
+        args.model,
+        output_dir,
+        defaults.model,
+        defaults.upstream_license,
+    )
 
-        print("Writing local ONNX model layout")
-        save_external_data_onnx(
-            encoder, output_dir / "encoder.onnx", "encoder.onnx.data"
-        )
-        save_single_file_onnx(decoder_joint, output_dir / "decoder_joint.onnx")
-        write_vocab(model, output_dir / "vocab.txt")
-        write_model_source(
-            args.model,
-            output_dir,
-            defaults.model,
-            defaults.upstream_license,
-        )
-    finally:
-        if args.keep_work_dir:
-            print(f"Kept export work directory: {run_dir}")
-        else:
-            shutil.rmtree(run_dir)
+    if not args.keep_work_dir and work_dir.exists():
+        shutil.rmtree(work_dir)
 
     print("Done")
     for path in [
