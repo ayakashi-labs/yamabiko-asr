@@ -4,11 +4,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-15
+
 ### Breaking changes
 
 - Removed the unused `Language` type, `Error::InvalidLanguageHint`, and the
   `TranscriberBuilder::language` and `language_hint` methods. Language behavior
   is now determined entirely by the loaded model.
+- Replaced the raw Tokio event receiver exposed by `TranscriptionSession` and
+  `into_parts()` with `TranscriptEventReceiver`.
+
+### Added
+
+- Added `OutputMonitor` and `OutputMetrics` snapshots for pending, peak,
+  emitted, received, discarded, and failed transcript-event delivery counts.
+- Added output-backlog warnings and a shutdown metrics summary to the
+  `audio_input` example.
+- Added Windows CI coverage for formatting, Clippy, tests, packaging, and the
+  Rust 1.88 minimum supported version.
+
+### Changed
+
+- Kept transcript delivery unbounded and lossless while exposing backlog
+  visibility for long-running applications.
+- Made closing or dropping the transcript receiver cancel subsequent input
+  processing and worker output without discarding events that remain available
+  for draining after an explicit close.
+- Documented the 0.2 migration, output monitoring, receiver cancellation, and
+  the intentional absence of partial transcript updates.
 
 ## [0.2.1] - 2026-07-14
 
@@ -61,6 +84,7 @@ All notable changes to this project are documented in this file.
 - Corrected 8-, 16-, 24-, and 32-bit integer WAV normalization.
 - Flushed and released each audio source independently.
 
-[Unreleased]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.1.0...v0.2.0
