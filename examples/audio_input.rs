@@ -12,6 +12,8 @@ mod resampler;
 #[cfg(target_os = "windows")]
 use capture::{CaptureDevice, print_event};
 #[cfg(target_os = "windows")]
+use std::fmt::Display;
+#[cfg(target_os = "windows")]
 use std::time::Instant;
 const USAGE: &str = "usage: audio_input [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir>";
 
@@ -63,9 +65,7 @@ async fn main() -> common::ExampleResult<()> {
     ) {
         Ok(capture) => capture,
         Err(error) => {
-            events.close();
-            worker.await?;
-            return Err(error);
+            return fail_after_startup(error, &mut events, Vec::new(), worker).await;
         }
     };
     captures.push(microphone_capture);
@@ -73,10 +73,7 @@ async fn main() -> common::ExampleResult<()> {
         match device.start(session_started, input, capture_failure_tx.clone()) {
             Ok(capture) => captures.push(capture),
             Err(error) => {
-                events.close();
-                let _ = finish_captures(captures);
-                worker.await?;
-                return Err(error);
+                return fail_after_startup(error, &mut events, captures, worker).await;
             }
         }
     }
@@ -85,9 +82,7 @@ async fn main() -> common::ExampleResult<()> {
 
     for capture in &captures {
         if let Err(error) = capture.play() {
-            let _ = finish_captures(captures);
-            worker.await?;
-            return Err(error);
+            return fail_after_startup(error, &mut events, captures, worker).await;
         }
     }
     let mode = if CAPTURE_SYSTEM_AUDIO {
@@ -151,8 +146,13 @@ async fn main() -> common::ExampleResult<()> {
         }
     }
 
-    let forwarding_failure = finish_captures(captures).err();
-    worker.await?;
+    let forwarding_failure = finish_captures(captures)
+        .err()
+        .map(|error| error.to_string());
+    let worker_failure = worker
+        .await
+        .err()
+        .map(|error| format!("transcription worker failed: {error}"));
     let metrics = output_monitor.metrics();
     println!(
         "Output stats: emitted={}, received={}, peak_pending={}, discarded={}, delivery_failures={}",
@@ -163,18 +163,49 @@ async fn main() -> common::ExampleResult<()> {
         metrics.delivery_failures,
     );
 
+    let mut failures = Vec::new();
     if let Some(error) = transcription_failure {
-        return Err(error.into());
+        failures.push(error.to_string());
     }
-    if let Some(error) = forwarding_failure {
-        return Err(error);
+    if let Some(error) = &forwarding_failure {
+        failures.push(error.clone());
     }
-    if let Some(error) = capture_failure {
-        return Err(error.into());
+    if let Some(error) = capture_failure
+        && !forwarding_failure
+            .as_ref()
+            .is_some_and(|forwarding| forwarding.contains(&error))
+    {
+        failures.push(error);
+    }
+    if let Some(error) = worker_failure {
+        failures.push(error);
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("; ").into());
     }
     println!("Stopped.");
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn fail_after_startup(
+    primary: impl Display,
+    events: &mut yamabiko_asr::TranscriptEventReceiver,
+    captures: Vec<capture::Capture>,
+    worker: yamabiko_asr::TranscriptionWorker,
+) -> common::ExampleResult<()> {
+    let mut failures = vec![primary.to_string()];
+    if let Err(error) = finish_captures(captures) {
+        failures.push(format!("capture cleanup failed: {error}"));
+    }
+    events.close();
+    if let Err(error) = worker.await {
+        failures.push(format!(
+            "transcription worker failed during cleanup: {error}"
+        ));
+    }
+    Err(failures.join("; ").into())
 }
 
 #[cfg(target_os = "windows")]

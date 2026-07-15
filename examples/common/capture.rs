@@ -226,7 +226,19 @@ fn spawn_forwarder(
     failure_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> JoinHandle<ExampleResult<()>> {
     std::thread::spawn(move || {
-        let forward_result = forward_audio(&input, sample_rate, pcm_rx, &failure);
+        let forward_result = match forward_audio(&input, sample_rate, pcm_rx, &failure) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let (_, message) = report_failure(
+                    label,
+                    "forwarding",
+                    &error.to_string(),
+                    &failure,
+                    &failure_tx,
+                );
+                Err(message.into())
+            }
+        };
         let close_result = input.blocking_close();
         let result: ExampleResult<()> = match (forward_result, close_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -237,18 +249,18 @@ fn spawn_forwarder(
             )
             .into()),
         };
-        if let Err(err) = result {
-            let capture_failed = failure.message().is_some();
-            let operation = if capture_failed {
-                "capture"
-            } else {
-                "forwarding"
-            };
-            let message = format!("{label} {operation} failed: {err}");
-            if !capture_failed {
-                let _ = failure_tx.send(message.clone());
+        if let Err(error) = result {
+            if failure.message().is_none() {
+                let (_, message) = report_failure(
+                    label,
+                    "forwarding",
+                    &error.to_string(),
+                    &failure,
+                    &failure_tx,
+                );
+                return Err(message.into());
             }
-            return Err(message.into());
+            return Err(error);
         }
         Ok(())
     })
@@ -311,10 +323,25 @@ fn report_capture_failure(
     failure_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     pcm_tx: &SyncSender<CaptureMessage>,
 ) {
-    if failure.record(message.clone()) {
-        let _ = failure_tx.send(format!("{label} capture failed: {message}"));
+    if report_failure(label, "capture", &message, failure, failure_tx).0 {
         let _ = pcm_tx.try_send(CaptureMessage::Wake);
     }
+}
+
+fn report_failure(
+    label: &str,
+    operation: &str,
+    message: &str,
+    failure: &CaptureFailure,
+    failure_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+) -> (bool, String) {
+    let message = format!("{label} {operation} failed: {message}");
+    let recorded = failure.record(message.clone());
+    let message = failure.message().unwrap_or(&message).to_string();
+    if recorded {
+        let _ = failure_tx.send(message.clone());
+    }
+    (recorded, message)
 }
 
 fn send_complete_chunks(
@@ -373,11 +400,40 @@ mod tests {
             &pcm_tx,
         );
 
-        assert_eq!(failure.message(), Some("first"));
+        assert_eq!(failure.message(), Some("microphone capture failed: first"));
         assert_eq!(
             failure_rx.try_recv().unwrap(),
             "microphone capture failed: first"
         );
+        assert!(failure_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn forwarding_failure_suppresses_disconnected_capture_notification() {
+        let failure = CaptureFailure::default();
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pcm_tx, _pcm_rx) = std::sync::mpsc::sync_channel(1);
+
+        let (recorded, message) = report_failure(
+            "microphone",
+            "forwarding",
+            "ASR input closed",
+            &failure,
+            &failure_tx,
+        );
+        assert!(recorded);
+        assert_eq!(message, "microphone forwarding failed: ASR input closed");
+
+        report_capture_failure(
+            "microphone",
+            "audio forwarding thread stopped".to_string(),
+            &failure,
+            &failure_tx,
+            &pcm_tx,
+        );
+
+        assert_eq!(failure.message(), Some(message.as_str()));
+        assert_eq!(failure_rx.try_recv().unwrap(), message);
         assert!(failure_rx.try_recv().is_err());
     }
 }
