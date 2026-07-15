@@ -120,14 +120,20 @@ impl VadConfig {
                 "VAD threshold must be a finite value from 0.0 to 1.0".to_string(),
             ));
         }
-        if self.min_speech.is_zero() {
+        let options = self.options();
+        if options.min_speech_samples() == 0 {
             return Err(Error::InvalidConfig(
-                "VAD min_speech must be greater than zero".to_string(),
+                "VAD min_speech must be at least one millisecond".to_string(),
             ));
         }
-        if self.min_silence.is_zero() {
+        if options.min_silence_samples() == 0 {
             return Err(Error::InvalidConfig(
-                "VAD min_silence must be greater than zero".to_string(),
+                "VAD min_silence must be at least one millisecond".to_string(),
+            ));
+        }
+        if !self.speech_pad.is_zero() && options.speech_pad_samples() == 0 {
+            return Err(Error::InvalidConfig(
+                "VAD speech_pad must be zero or at least one millisecond".to_string(),
             ));
         }
         if self.max_speech.is_zero() {
@@ -135,7 +141,6 @@ impl VadConfig {
                 "VAD max_speech must be greater than zero".to_string(),
             ));
         }
-        let options = self.options();
         if options
             .max_speech_samples()
             .is_some_and(|max| max < options.min_speech_samples())
@@ -219,6 +224,36 @@ mod tests {
         assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
 
         config.max_speech = Duration::from_millis(342);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn vad_rejects_nonzero_durations_truncated_to_zero_samples() {
+        let sub_millisecond = Duration::from_nanos(999_999);
+
+        for config in [
+            VadConfig {
+                min_speech: sub_millisecond,
+                ..VadConfig::default()
+            },
+            VadConfig {
+                min_silence: sub_millisecond,
+                ..VadConfig::default()
+            },
+            VadConfig {
+                speech_pad: sub_millisecond,
+                ..VadConfig::default()
+            },
+        ] {
+            assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
+        }
+
+        let config = VadConfig {
+            min_speech: Duration::from_millis(1),
+            min_silence: Duration::from_millis(1),
+            speech_pad: Duration::ZERO,
+            ..VadConfig::default()
+        };
         config.validate().unwrap();
     }
 }
