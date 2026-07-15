@@ -87,8 +87,8 @@ impl ParakeetTdtModel {
         let log_zero_guard = 2.0f32.powi(-24);
         mel_spectrogram.mapv_inplace(|value| (value + log_zero_guard).ln());
 
-        let valid_frames = valid_feature_frames(audio.len()).min(mel_spectrogram.shape()[1]);
-        normalize_features(&mut mel_spectrogram, valid_frames);
+        let valid_frames = valid_feature_frames(audio.len());
+        normalize_features(&mut mel_spectrogram, valid_frames)?;
         Ok((mel_spectrogram, valid_frames))
     }
 
@@ -97,12 +97,6 @@ impl ParakeetTdtModel {
         features: &Array2<f32>,
         valid_frames: usize,
     ) -> Result<Vec<usize>> {
-        let time_steps = features.shape()[1];
-        if valid_frames > time_steps {
-            return Err(Error::Backend(format!(
-                "feature length {valid_frames} exceeds tensor length {time_steps}"
-            )));
-        }
         let input = features.view().insert_axis(Axis(0));
         let input_length = [i64::try_from(valid_frames)
             .map_err(|_| Error::Backend("feature length exceeds i64".to_string()))?];
@@ -202,8 +196,13 @@ fn valid_feature_frames(sample_count: usize) -> usize {
     sample_count / HOP_LENGTH
 }
 
-fn normalize_features(features: &mut Array2<f32>, valid_frames: usize) {
-    let valid_frames = valid_frames.min(features.shape()[1]);
+fn normalize_features(features: &mut Array2<f32>, valid_frames: usize) -> Result<()> {
+    let total_frames = features.shape()[1];
+    if valid_frames > total_frames {
+        return Err(Error::Backend(format!(
+            "feature length {valid_frames} exceeds tensor length {total_frames}"
+        )));
+    }
     for mut feature in features.rows_mut() {
         if valid_frames == 0 {
             feature.fill(0.0);
@@ -230,6 +229,7 @@ fn normalize_features(features: &mut Array2<f32>, valid_frames: usize) {
             }
         }
     }
+    Ok(())
 }
 
 fn greedy_decode(
@@ -949,13 +949,14 @@ mod tests {
     #[test]
     fn normalization_uses_only_nemo_valid_frames_and_masks_the_tail() {
         let mut features = Array2::from_shape_vec((1, 3), vec![1.0, 3.0, 100.0]).unwrap();
-        normalize_features(&mut features, 2);
+        normalize_features(&mut features, 2).unwrap();
 
         let expected = 1.0 / (2.0f32.sqrt() + 1e-5);
         assert!((features[[0, 0]] + expected).abs() < 1e-5);
         assert!((features[[0, 1]] - expected).abs() < 1e-5);
         assert_eq!(features[[0, 2]], 0.0);
         assert_eq!(valid_feature_frames(PCM_SAMPLE_RATE_HZ as usize), 100);
+        assert!(normalize_features(&mut features, 4).is_err());
     }
 
     #[test]
