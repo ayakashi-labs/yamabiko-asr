@@ -287,27 +287,12 @@ fn greedy_decode(
             .try_extract_tensor::<f32>()
             .map_err(|err| Error::Backend(format!("failed to extract decoder logits: {err}")))?;
         let logits_dims = logits_shape.as_ref();
-        let Some((&logits_dimension, leading_dimensions)) = logits_dims.split_last() else {
+        let logits_size = decoder_logits_size(logits_dims, vocab_size, false)
+            .map_err(Error::Backend)?
+            .ok_or_else(|| Error::Backend("decoder returned dynamic logits shape".to_string()))?;
+        if logits_data.len() != logits_size {
             return Err(Error::Backend(format!(
-                "decoder returned scalar logits with shape {logits_dims:?}"
-            )));
-        };
-        if leading_dimensions.iter().any(|&dimension| dimension != 1) {
-            return Err(Error::Backend(format!(
-                "decoder logits must contain one prediction, got shape {logits_dims:?}"
-            )));
-        }
-        let logits_size = usize::try_from(logits_dimension).map_err(|_| {
-            Error::Backend(format!(
-                "invalid decoder logits dimension: {logits_dimension}"
-            ))
-        })?;
-        let minimum_logits = vocab_size
-            .checked_add(1)
-            .ok_or_else(|| Error::Backend("decoder logits size overflow".to_string()))?;
-        if logits_size < minimum_logits || logits_data.len() != logits_size {
-            return Err(Error::Backend(format!(
-                "decoder returned {} logits with shape {logits_dims:?}; expected at least {minimum_logits}",
+                "decoder returned {} logits with shape {logits_dims:?}; expected {logits_size}",
                 logits_data.len()
             )));
         }
@@ -528,14 +513,7 @@ fn validate_decoder_joint_contract(
         None,
         &[],
     )?;
-    if logits_shape.is_empty() {
-        return Err(Error::ModelLoad(
-            "decoder output 'outputs' must not be a scalar".to_string(),
-        ));
-    }
-    for index in 0..logits_shape.len() - 1 {
-        require_compatible_dimension(logits_shape, index, 1, "decoder logits")?;
-    }
+    decoder_logits_size(logits_shape, vocab_size, true).map_err(Error::ModelLoad)?;
     for name in ["output_states_1", "output_states_2"] {
         require_tensor(
             decoder_joint.outputs(),
@@ -555,18 +533,50 @@ fn validate_decoder_joint_contract(
             "decoder encoder_outputs feature",
         )?;
     }
-    if let Some(logits_size) = known_dimension(logits_shape, 3, "decoder logits")? {
-        let minimum_logits = vocab_size
-            .checked_add(1)
-            .ok_or_else(|| Error::ModelLoad("decoder logits size overflow".to_string()))?;
-        if logits_size < minimum_logits {
-            return Err(Error::ModelLoad(format!(
-                "decoder logits dimension {logits_size} is too small for {vocab_size} vocabulary entries and a duration output"
-            )));
-        }
+    Ok(())
+}
+
+fn decoder_logits_size(
+    shape: &[i64],
+    vocab_size: usize,
+    allow_dynamic: bool,
+) -> std::result::Result<Option<usize>, String> {
+    let Some((&last_dimension, leading_dimensions)) = shape.split_last() else {
+        return Err("decoder logits must not be a scalar".to_string());
+    };
+    if leading_dimensions
+        .iter()
+        .any(|&dimension| dimension != 1 && !(allow_dynamic && dimension == -1))
+    {
+        return Err(format!(
+            "decoder logits must contain one prediction, got shape {shape:?}"
+        ));
     }
 
-    Ok(())
+    let logits_size = match last_dimension {
+        -1 if allow_dynamic => None,
+        value if value > 0 => Some(
+            usize::try_from(value)
+                .map_err(|_| format!("decoder logits dimension is too large: {value}"))?,
+        ),
+        value => {
+            return Err(format!(
+                "decoder logits dimension must be positive{}, got {value}",
+                if allow_dynamic { " or dynamic" } else { "" }
+            ));
+        }
+    };
+    let minimum_logits = vocab_size
+        .checked_add(1)
+        .ok_or_else(|| "decoder logits size overflow".to_string())?;
+    if let Some(logits_size) = logits_size
+        && logits_size < minimum_logits
+    {
+        return Err(format!(
+            "decoder logits dimension {logits_size} is too small for {vocab_size} vocabulary entries and a duration output"
+        ));
+    }
+    Ok(logits_size)
 }
 
 fn require_tensor<'a>(
@@ -994,6 +1004,20 @@ mod tests {
         assert_eq!(known_dimension(&[-1, 80, -1], 1, "test").unwrap(), Some(80));
         assert!(known_dimension(&[-1, 0, -1], 1, "test").is_err());
         assert!(known_dimension(&[-1, -2, -1], 1, "test").is_err());
+    }
+
+    #[test]
+    fn decoder_logits_contract_uses_the_final_dimension_at_any_rank() {
+        for shape in [&[7][..], &[1, 1, 7], &[1, 1, 1, 1, 7]] {
+            assert_eq!(decoder_logits_size(shape, 5, true).unwrap(), Some(7));
+            assert_eq!(decoder_logits_size(shape, 5, false).unwrap(), Some(7));
+        }
+
+        assert_eq!(decoder_logits_size(&[1, -1], 5, true).unwrap(), None);
+        assert!(decoder_logits_size(&[1, -1], 5, false).is_err());
+        assert!(decoder_logits_size(&[], 5, true).is_err());
+        assert!(decoder_logits_size(&[2, 7], 5, true).is_err());
+        assert!(decoder_logits_size(&[1, 5], 5, true).is_err());
     }
 
     #[test]
