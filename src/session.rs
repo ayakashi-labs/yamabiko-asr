@@ -221,8 +221,8 @@ impl TranscriptEventReceiver {
     /// already queued when the receiver closed.
     pub fn close(&mut self) {
         self.inner.close();
-        self.monitor.state.record_receiver_closed();
         self.cancel_worker();
+        self.monitor.state.record_receiver_closed();
     }
 
     /// Return the number of events currently waiting to be received.
@@ -269,11 +269,7 @@ impl Drop for TranscriptEventReceiver {
     fn drop(&mut self) {
         self.inner.close();
         self.cancel_worker();
-
-        let mut discarded = 0usize;
-        while self.inner.try_recv().is_ok() {
-            discarded = discarded.saturating_add(1);
-        }
+        let discarded = self.inner.len();
         self.monitor.state.record_discarded(discarded);
     }
 }
@@ -390,7 +386,9 @@ impl AudioInput {
             .await
             .map_err(|_| Error::StreamClosed)?;
         self.closed = true;
-        reply_rx.await.map_err(|_| Error::StreamClosed)?
+        let result = reply_rx.await.map_err(|_| Error::StreamClosed)?;
+        self.ensure_active()?;
+        result
     }
 
     /// Finish and release this source from a non-async capture thread.
@@ -408,7 +406,9 @@ impl AudioInput {
             })
             .map_err(|_| Error::StreamClosed)?;
         self.closed = true;
-        reply_rx.blocking_recv().map_err(|_| Error::StreamClosed)?
+        let result = reply_rx.blocking_recv().map_err(|_| Error::StreamClosed)?;
+        self.ensure_active()?;
+        result
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -440,9 +440,7 @@ pub struct TranscriptionSession {
     /// After an error, the worker closes the event channel without emitting
     /// `TranscriptEvent::EndOfStream`.
     pub events: TranscriptEventReceiver,
-    pub(crate) commands: mpsc::Sender<SessionCommand>,
     pub(crate) worker: TranscriptionWorker,
-    pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 impl TranscriptionSession {
@@ -451,22 +449,20 @@ impl TranscriptionSession {
     /// This waits for the source's VAD session to initialize. Closing a source
     /// releases its state and makes its capacity available to another source.
     pub async fn open_source(&self) -> Result<AudioInput> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(Error::StreamClosed);
-        }
+        self.input.ensure_active()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
+        self.input
+            .commands
             .send(SessionCommand::OpenSource { reply: reply_tx })
             .await
             .map_err(|_| Error::StreamClosed)?;
-        let source_id = reply_rx.await.map_err(|_| Error::StreamClosed)??;
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(Error::StreamClosed);
-        }
+        let result = reply_rx.await.map_err(|_| Error::StreamClosed)?;
+        self.input.ensure_active()?;
+        let source_id = result?;
         Ok(AudioInput::new(
             source_id,
-            self.commands.clone(),
-            Arc::clone(&self.cancelled),
+            self.input.commands.clone(),
+            Arc::clone(&self.input.cancelled),
         ))
     }
 
@@ -996,6 +992,50 @@ mod tests {
         assert_eq!(metrics.discarded_events, 2);
         assert_eq!(metrics.delivery_failures, 1);
         assert!(metrics.receiver_closed);
+    }
+
+    #[test]
+    fn closing_receiver_sets_cancellation_before_metrics_lock() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_event_tx, mut events, cancelled) = output_channel(command_tx.downgrade());
+        let monitor = events.monitor();
+        let metrics_guard = monitor.state.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+        let closer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            events.close();
+            events
+        });
+        started_rx.recv().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let cancelled_before_unlock = cancelled.load(Ordering::Acquire);
+        drop(metrics_guard);
+        drop(closer.join().unwrap());
+
+        assert!(cancelled_before_unlock);
+    }
+
+    #[tokio::test]
+    async fn input_close_observes_cancellation_after_worker_reply() {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let input = AudioInput::new(AudioSourceId::PRIMARY, command_tx, Arc::clone(&cancelled));
+
+        let responder = tokio::spawn(async move {
+            let SessionCommand::CloseSource { reply, .. } = command_rx.recv().await.unwrap() else {
+                panic!("expected close command");
+            };
+            cancelled.store(true, Ordering::Release);
+            reply.unwrap().send(Ok(())).unwrap();
+        });
+
+        assert_eq!(input.close().await, Err(Error::StreamClosed));
+        responder.await.unwrap();
     }
 
     #[test]

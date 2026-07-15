@@ -115,15 +115,9 @@ impl Transcriber {
         });
 
         TranscriptionSession {
-            input: AudioInput::new(
-                AudioSourceId::PRIMARY,
-                command_tx.clone(),
-                std::sync::Arc::clone(&cancelled),
-            ),
+            input: AudioInput::new(AudioSourceId::PRIMARY, command_tx, cancelled),
             events,
-            commands: command_tx,
             worker,
-            cancelled,
         }
     }
 
@@ -766,6 +760,60 @@ mod tests {
         assert!(metrics.receiver_closed);
         assert_eq!(metrics.emitted_events, 0);
         assert_eq!(metrics.pending_events, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_partially_moved_last_input_closes_full_command_queue() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let transcriber = Transcriber {
+            input_capacity: 1,
+            max_sources: 1,
+            model: Box::new(BlockingModel {
+                started: started_tx,
+                release: release_rx,
+            }),
+            vad: Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }]],
+            }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+        };
+        let session = transcriber.start();
+        let input = session.input;
+        let mut events = session.events;
+        let worker = session.worker;
+
+        input.send(vec![0.1; 4]).await.unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        input.send(vec![0.2; 4]).await.unwrap();
+        drop(input);
+        release_tx.send(()).unwrap();
+
+        for _ in 0..2_000 {
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            worker.is_finished(),
+            "worker did not observe the closed input"
+        );
+        worker.await.unwrap();
+
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::Segment(_)
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+        assert_eq!(events.recv().await, None);
     }
 
     #[test]
