@@ -64,44 +64,36 @@ impl ParakeetTdtModel {
 
     pub(crate) fn transcribe_samples(&mut self, mut samples: Vec<f32>) -> Result<String> {
         apply_preemphasis_in_place(&mut samples, PREEMPHASIS);
-        let features = self.extract_features(&samples)?;
-        let tokens = self.run_encoder_and_decode(&features)?;
+        let (features, valid_frames) = self.extract_features(&samples)?;
+        let tokens = self.run_encoder_and_decode(&features, valid_frames)?;
         Ok(self.decode_tokens(&tokens))
     }
 
-    fn extract_features(&self, audio: &[f32]) -> Result<Array2<f32>> {
+    fn extract_features(&self, audio: &[f32]) -> Result<(Array2<f32>, usize)> {
         let spectrogram = stft_with_plan(audio, &self.fft_plan, &self.window, N_FFT, HOP_LENGTH)?;
         let mut mel_spectrogram = self.mel_basis.dot(&spectrogram);
         let log_zero_guard = 2.0f32.powi(-24);
         mel_spectrogram.mapv_inplace(|value| (value + log_zero_guard).ln());
 
-        let num_features = mel_spectrogram.shape()[0];
-        let num_frames = mel_spectrogram.shape()[1];
-        if num_frames <= 1 {
-            return Ok(mel_spectrogram);
-        }
-
-        for feat_idx in 0..num_features {
-            let mut feature = mel_spectrogram.row_mut(feat_idx);
-            let mean = feature.iter().sum::<f32>() / num_frames as f32;
-            let variance = feature
-                .iter()
-                .map(|&value| (value - mean).powi(2))
-                .sum::<f32>()
-                / (num_frames as f32 - 1.0);
-            let std = variance.sqrt() + 1e-5;
-            for value in feature.iter_mut() {
-                *value = (*value - mean) / std;
-            }
-        }
-
-        Ok(mel_spectrogram)
+        let valid_frames = valid_feature_frames(audio.len()).min(mel_spectrogram.shape()[1]);
+        normalize_features(&mut mel_spectrogram, valid_frames);
+        Ok((mel_spectrogram, valid_frames))
     }
 
-    fn run_encoder_and_decode(&mut self, features: &Array2<f32>) -> Result<Vec<usize>> {
+    fn run_encoder_and_decode(
+        &mut self,
+        features: &Array2<f32>,
+        valid_frames: usize,
+    ) -> Result<Vec<usize>> {
         let time_steps = features.shape()[1];
+        if valid_frames > time_steps {
+            return Err(Error::Backend(format!(
+                "feature length {valid_frames} exceeds tensor length {time_steps}"
+            )));
+        }
         let input = features.view().insert_axis(Axis(0));
-        let input_length = [time_steps as i64];
+        let input_length = [i64::try_from(valid_frames)
+            .map_err(|_| Error::Backend("feature length exceeds i64".to_string()))?];
         let vocab_size = self.vocab.len();
         let encoder = &mut self.encoder;
         let decoder_joint = &mut self.decoder_joint;
@@ -185,6 +177,40 @@ impl ParakeetTdtModel {
             text.push_str(&token_text.replace(SENTENCEPIECE_SPACE, replacement));
         }
         text.trim().to_string()
+    }
+}
+
+fn valid_feature_frames(sample_count: usize) -> usize {
+    sample_count / HOP_LENGTH
+}
+
+fn normalize_features(features: &mut Array2<f32>, valid_frames: usize) {
+    let valid_frames = valid_frames.min(features.shape()[1]);
+    for mut feature in features.rows_mut() {
+        if valid_frames == 0 {
+            feature.fill(0.0);
+            continue;
+        }
+
+        let mean = feature.iter().take(valid_frames).sum::<f32>() / valid_frames as f32;
+        let variance = if valid_frames > 1 {
+            feature
+                .iter()
+                .take(valid_frames)
+                .map(|&value| (value - mean).powi(2))
+                .sum::<f32>()
+                / (valid_frames as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let std = variance.sqrt() + 1e-5;
+        for (frame, value) in feature.iter_mut().enumerate() {
+            if frame < valid_frames {
+                *value = (*value - mean) / std;
+            } else {
+                *value = 0.0;
+            }
+        }
     }
 }
 
@@ -488,10 +514,17 @@ fn stft_with_plan(
     n_fft: usize,
     hop_length: usize,
 ) -> Result<Array2<f32>> {
+    if window.len() > n_fft {
+        return Err(Error::Backend(format!(
+            "STFT window length {} exceeds FFT length {n_fft}",
+            window.len()
+        )));
+    }
     let pad_amount = n_fft / 2;
     let padded_len = audio.len().saturating_add(pad_amount * 2);
     let num_frames = (padded_len - n_fft) / hop_length + 1;
     let freq_bins = n_fft / 2 + 1;
+    let window_offset = (n_fft - window.len()) / 2;
     let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
     let mut input = vec![0.0; n_fft];
     let mut output = plan.make_output_vec();
@@ -500,12 +533,13 @@ fn stft_with_plan(
     for frame_idx in 0..num_frames {
         let start = frame_idx * hop_length;
         input.fill(0.0);
-        for (sample_idx, &weight) in window.iter().enumerate() {
-            let padded_index = start + sample_idx;
+        for (window_idx, &weight) in window.iter().enumerate() {
+            let fft_idx = window_offset + window_idx;
+            let padded_index = start + fft_idx;
             if let Some(audio_index) = padded_index.checked_sub(pad_amount)
                 && let Some(&sample) = audio.get(audio_index)
             {
-                input[sample_idx] = sample * weight;
+                input[fft_idx] = sample * weight;
             }
         }
 
@@ -607,6 +641,30 @@ mod tests {
         assert_eq!(audio[0], 1.0);
         assert!((audio[1] - 1.03).abs() < 1e-6);
         assert!((audio[2] - 1.06).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stft_centers_a_shorter_window_inside_the_fft_frame() {
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let plan = planner.plan_fft_forward(8);
+        let spectrogram =
+            stft_with_plan(&[1.0, 0.0, 0.0, 0.0], &plan, &[1.0, 2.0, 3.0, 4.0], 8, 4).unwrap();
+
+        for magnitude in spectrogram.column(0) {
+            assert!((*magnitude - 9.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn normalization_uses_only_nemo_valid_frames_and_masks_the_tail() {
+        let mut features = Array2::from_shape_vec((1, 3), vec![1.0, 3.0, 100.0]).unwrap();
+        normalize_features(&mut features, 2);
+
+        let expected = 1.0 / (2.0f32.sqrt() + 1e-5);
+        assert!((features[[0, 0]] + expected).abs() < 1e-5);
+        assert!((features[[0, 1]] - expected).abs() < 1e-5);
+        assert_eq!(features[[0, 2]], 0.0);
+        assert_eq!(valid_feature_frames(PCM_SAMPLE_RATE_HZ as usize), 100);
     }
 
     #[test]
