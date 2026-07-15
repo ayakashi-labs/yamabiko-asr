@@ -382,9 +382,7 @@ impl AudioInput {
             .await
             .map_err(|_| Error::StreamClosed)?;
         self.closed = true;
-        let result = reply_rx.await.map_err(|_| Error::StreamClosed)?;
-        self.ensure_active()?;
-        result
+        reply_rx.await.map_err(|_| Error::StreamClosed)?
     }
 
     /// Finish and release this source from a non-async capture thread.
@@ -402,9 +400,7 @@ impl AudioInput {
             })
             .map_err(|_| Error::StreamClosed)?;
         self.closed = true;
-        let result = reply_rx.blocking_recv().map_err(|_| Error::StreamClosed)?;
-        self.ensure_active()?;
-        result
+        reply_rx.blocking_recv().map_err(|_| Error::StreamClosed)?
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -1011,7 +1007,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_close_observes_cancellation_after_worker_reply() {
+    async fn input_close_uses_worker_reply_as_its_linearization_point() {
         let (command_tx, mut command_rx) = mpsc::channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let input = AudioInput::new(AudioSourceId::PRIMARY, command_tx, Arc::clone(&cancelled));
@@ -1024,7 +1020,7 @@ mod tests {
             reply.unwrap().send(Ok(())).unwrap();
         });
 
-        assert_eq!(input.close().await, Err(Error::StreamClosed));
+        assert_eq!(input.close().await, Ok(()));
         responder.await.unwrap();
     }
 
