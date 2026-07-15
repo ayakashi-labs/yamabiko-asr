@@ -666,6 +666,7 @@ mod tests {
         let monitor = events.monitor();
 
         input.close().await.unwrap();
+        worker.await.unwrap();
         let queued = monitor.metrics();
         assert_eq!(queued.pending_events, 3);
         assert_eq!(queued.peak_pending_events, 3);
@@ -679,7 +680,6 @@ mod tests {
         assert!(matches!(first, TranscriptEvent::Segment(_)));
         assert!(matches!(second, TranscriptEvent::Segment(_)));
         assert!(matches!(end, TranscriptEvent::EndOfStream));
-        worker.await.unwrap();
 
         let drained = monitor.metrics();
         assert_eq!(drained.pending_events, 0);
