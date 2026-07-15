@@ -39,7 +39,7 @@ jobs:
         run: cargo test --locked --doc --all-features
 
       - name: Test model export helpers
-        run: python -B tools/test_parakeet_export.py
+        run: python tools/test_parakeet_export.py
 
       - name: Check package contents
         run: cargo package --locked
