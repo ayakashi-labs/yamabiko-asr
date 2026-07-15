@@ -37,15 +37,22 @@ mod session;
 mod tdt;
 mod vad;
 
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {}
+
 pub use builder::TranscriberBuilder;
 pub use config::{AudioSourceId, Device, PCM_SAMPLE_RATE_HZ};
 pub(crate) use config::{TranscriberConfig, VadConfig};
 pub use error::{Error, Result};
 pub use event::{SegmentId, SpeakerId, TranscriptEvent, TranscriptSegment};
-pub use session::{AudioInput, TranscriptionSession, TranscriptionWorker};
+pub use session::{
+    AudioInput, OutputMetrics, OutputMonitor, TranscriptEventReceiver, TranscriptionSession,
+    TranscriptionWorker,
+};
 
 use backend::ParakeetTdtModel;
-use session::{SessionCommand, run_transcription_worker};
+use session::{SessionCommand, output_channel, run_transcription_worker};
 use vad::{SileroVadFactory, VadFactory};
 
 /// A transcription engine backed by one loaded Parakeet ASR model.
@@ -93,7 +100,8 @@ impl Transcriber {
     pub fn start(self) -> TranscriptionSession {
         let (command_tx, command_rx) =
             tokio::sync::mpsc::channel::<SessionCommand>(self.input_capacity);
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, events, cancelled) = output_channel(command_tx.downgrade());
+        let worker_cancelled = std::sync::Arc::clone(&cancelled);
         let worker = tokio::task::spawn_blocking(move || {
             run_transcription_worker(
                 self.max_sources,
@@ -102,14 +110,20 @@ impl Transcriber {
                 self.vad_factory,
                 command_rx,
                 event_tx,
+                worker_cancelled,
             );
         });
 
         TranscriptionSession {
-            input: AudioInput::new(AudioSourceId::PRIMARY, command_tx.clone()),
-            events: event_rx,
+            input: AudioInput::new(
+                AudioSourceId::PRIMARY,
+                command_tx.clone(),
+                std::sync::Arc::clone(&cancelled),
+            ),
+            events,
             commands: command_tx,
             worker,
+            cancelled,
         }
     }
 
@@ -143,6 +157,7 @@ impl VadFactory for UnavailableVadFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -156,6 +171,19 @@ mod tests {
             self.calls.lock().unwrap().push(samples.len());
             self.next += 1;
             Ok(format!("chunk{}", self.next))
+        }
+    }
+
+    struct BlockingModel {
+        started: std_mpsc::Sender<()>,
+        release: std_mpsc::Receiver<()>,
+    }
+
+    impl backend::AsrModel for BlockingModel {
+        fn transcribe(&mut self, _samples: Vec<f32>) -> Result<String> {
+            self.started.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok("finished".to_string())
         }
     }
 
@@ -319,6 +347,41 @@ mod tests {
         let event = events.recv().await.unwrap().unwrap();
         assert!(matches!(event, TranscriptEvent::EndOfStream));
         worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_last_input_flushes_without_receiver_keeping_commands_alive() {
+        let transcriber = Transcriber::from_parts(
+            test_config(),
+            Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            Box::new(FinishVad {
+                chunks: vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }],
+            }),
+        )
+        .unwrap();
+
+        let (input, mut events, worker) = transcriber.start().into_parts();
+        let monitor = events.monitor();
+        drop(input);
+
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::Segment(_)
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+        assert_eq!(events.recv().await, None);
+        worker.await.unwrap();
+        assert_eq!(monitor.metrics().received_events, 2);
     }
 
     #[tokio::test]
@@ -600,8 +663,15 @@ mod tests {
             vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
         };
         let (input, mut events, worker) = transcriber.start().into_parts();
+        let monitor = events.monitor();
 
         input.close().await.unwrap();
+        let queued = monitor.metrics();
+        assert_eq!(queued.pending_events, 3);
+        assert_eq!(queued.peak_pending_events, 3);
+        assert_eq!(queued.emitted_events, 3);
+        assert_eq!(queued.received_events, 0);
+
         let first = events.recv().await.unwrap().unwrap();
         let second = events.recv().await.unwrap().unwrap();
         let end = events.recv().await.unwrap().unwrap();
@@ -610,6 +680,92 @@ mod tests {
         assert!(matches!(second, TranscriptEvent::Segment(_)));
         assert!(matches!(end, TranscriptEvent::EndOfStream));
         worker.await.unwrap();
+
+        let drained = monitor.metrics();
+        assert_eq!(drained.pending_events, 0);
+        assert_eq!(drained.received_events, 3);
+        assert_eq!(drained.discarded_events, 0);
+        assert_eq!(drained.delivery_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn closing_event_receiver_cancels_idle_session() {
+        let transcriber = Transcriber::from_parts(
+            test_config(),
+            Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            Box::new(FakeVad { chunks: Vec::new() }),
+        )
+        .unwrap();
+        let mut session = transcriber.start();
+        let monitor = session.events.monitor();
+
+        session.events.close();
+        assert!(matches!(
+            session.open_source().await,
+            Err(Error::StreamClosed)
+        ));
+        assert!(matches!(
+            session.input.send(vec![0.0; 4]).await,
+            Err(Error::StreamClosed)
+        ));
+
+        let (input, mut events, worker) = session.into_parts();
+        assert_eq!(events.recv().await, None);
+        assert!(matches!(input.close().await, Err(Error::StreamClosed)));
+        worker.await.unwrap();
+
+        let metrics = monitor.metrics();
+        assert!(metrics.receiver_closed);
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.emitted_events, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_receiver_cancels_inference_with_full_command_queue() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let transcriber = Transcriber {
+            input_capacity: 1,
+            max_sources: 1,
+            model: Box::new(BlockingModel {
+                started: started_tx,
+                release: release_rx,
+            }),
+            vad: Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }]],
+            }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+        };
+        let (input, events, worker) = transcriber.start().into_parts();
+        let monitor = events.monitor();
+
+        input.send(vec![0.1; 4]).await.unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Fill the command queue while inference holds the worker. The
+        // receiver's best-effort Cancel command cannot be queued in this state,
+        // so the shared cancellation flag must still stop the worker.
+        input.send(vec![0.2; 4]).await.unwrap();
+        drop(events);
+        release_tx.send(()).unwrap();
+
+        worker.await.unwrap();
+        assert!(matches!(
+            input.send(vec![0.3; 4]).await,
+            Err(Error::StreamClosed)
+        ));
+
+        let metrics = monitor.metrics();
+        assert!(metrics.receiver_closed);
+        assert_eq!(metrics.emitted_events, 0);
+        assert_eq!(metrics.pending_events, 0);
     }
 
     #[test]
