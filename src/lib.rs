@@ -42,8 +42,8 @@ mod vad;
 mod readme_doctests {}
 
 pub use builder::TranscriberBuilder;
+pub(crate) use config::TranscriberConfig;
 pub use config::{AudioSourceId, Device, PCM_SAMPLE_RATE_HZ};
-pub(crate) use config::{TranscriberConfig, VadConfig};
 pub use error::{Error, Result};
 pub use event::{SegmentId, SpeakerId, TranscriptEvent, TranscriptSegment};
 pub use session::{
@@ -51,8 +51,8 @@ pub use session::{
     TranscriptionWorker,
 };
 
-use backend::ParakeetTdtModel;
 use session::{SessionCommand, output_channel, run_transcription_worker};
+use tdt::ParakeetTdtModel;
 use vad::{SileroVadFactory, VadFactory};
 
 /// A transcription engine backed by one loaded Parakeet ASR model.
@@ -74,9 +74,10 @@ impl Transcriber {
     /// Model loading is synchronous and may take long enough that GUI
     /// applications should call this away from their UI thread.
     pub(crate) fn new(config: TranscriberConfig) -> Result<Self> {
-        config.validate()?;
-        let model: Box<dyn backend::AsrModel> = Box::new(ParakeetTdtModel::load(&config)?);
-        let mut vad_factory = SileroVadFactory::new(config.vad.clone())?;
+        let vad_options = config.validate()?;
+        let model: Box<dyn backend::AsrModel> =
+            Box::new(ParakeetTdtModel::load(&config.model_dir, config.device)?);
+        let mut vad_factory = SileroVadFactory::new(vad_options)?;
         let vad = vad_factory.create()?;
         Ok(Self {
             input_capacity: config.input_capacity,
@@ -115,15 +116,9 @@ impl Transcriber {
         });
 
         TranscriptionSession {
-            input: AudioInput::new(
-                AudioSourceId::PRIMARY,
-                command_tx.clone(),
-                std::sync::Arc::clone(&cancelled),
-            ),
+            input: AudioInput::new(AudioSourceId::PRIMARY, command_tx, cancelled),
             events,
-            commands: command_tx,
             worker,
-            cancelled,
         }
     }
 
@@ -447,7 +442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discontinuous_explicit_timestamp_is_terminal_error() {
+    async fn terminal_error_follows_segments_without_end_of_stream() {
         let transcriber = Transcriber::from_parts(
             test_config(),
             Box::new(FakeModel {
@@ -455,7 +450,11 @@ mod tests {
                 next: 0,
             }),
             Box::new(FakeVad {
-                chunks: vec![Vec::new(), Vec::new()],
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 160],
+                    start_sample: 0,
+                    end_sample: 160,
+                }]],
             }),
         )
         .unwrap();
@@ -472,6 +471,13 @@ mod tests {
             .await
             .unwrap();
 
+        let segment = session.events.recv().await.unwrap().unwrap();
+        let TranscriptEvent::Segment(segment) = segment else {
+            panic!("expected segment before terminal error");
+        };
+        assert_eq!(segment.start, Duration::from_millis(100));
+        assert_eq!(segment.end, Duration::from_millis(110));
+
         let error = session.events.recv().await.unwrap().unwrap_err();
         assert!(matches!(
             error,
@@ -482,6 +488,8 @@ mod tests {
             } if expected == Duration::from_millis(110)
                 && actual == Duration::from_millis(105)
         ));
+        assert_eq!(session.events.recv().await, None);
+        session.worker.await.unwrap();
     }
 
     #[tokio::test]
@@ -724,6 +732,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_event_receiver_cancels_idle_session() {
+        let transcriber = Transcriber::from_parts(
+            test_config(),
+            Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            Box::new(FakeVad { chunks: Vec::new() }),
+        )
+        .unwrap();
+        let (input, events, worker) = transcriber.start().into_parts();
+        let monitor = events.monitor();
+
+        drop(events);
+        for _ in 0..2_000 {
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(worker.is_finished(), "worker did not observe receiver drop");
+        worker.await.unwrap();
+
+        assert!(matches!(
+            input.send(vec![0.0; 4]).await,
+            Err(Error::StreamClosed)
+        ));
+        assert!(matches!(input.close().await, Err(Error::StreamClosed)));
+
+        let metrics = monitor.metrics();
+        assert!(metrics.receiver_closed);
+        assert_eq!(metrics.pending_events, 0);
+        assert_eq!(metrics.emitted_events, 0);
+        assert_eq!(metrics.discarded_events, 0);
+        assert_eq!(metrics.delivery_failures, 0);
+    }
+
+    #[tokio::test]
     async fn dropping_receiver_cancels_inference_with_full_command_queue() {
         let (started_tx, started_rx) = std_mpsc::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
@@ -766,6 +812,60 @@ mod tests {
         assert!(metrics.receiver_closed);
         assert_eq!(metrics.emitted_events, 0);
         assert_eq!(metrics.pending_events, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_partially_moved_last_input_closes_full_command_queue() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let transcriber = Transcriber {
+            input_capacity: 1,
+            max_sources: 1,
+            model: Box::new(BlockingModel {
+                started: started_tx,
+                release: release_rx,
+            }),
+            vad: Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }]],
+            }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+        };
+        let session = transcriber.start();
+        let input = session.input;
+        let mut events = session.events;
+        let worker = session.worker;
+
+        input.send(vec![0.1; 4]).await.unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        input.send(vec![0.2; 4]).await.unwrap();
+        drop(input);
+        release_tx.send(()).unwrap();
+
+        for _ in 0..2_000 {
+            if worker.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            worker.is_finished(),
+            "worker did not observe the closed input"
+        );
+        worker.await.unwrap();
+
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::Segment(_)
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+        assert_eq!(events.recv().await, None);
     }
 
     #[test]

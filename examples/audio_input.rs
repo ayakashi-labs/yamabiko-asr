@@ -12,6 +12,8 @@ mod resampler;
 #[cfg(target_os = "windows")]
 use capture::{CaptureDevice, print_event};
 #[cfg(target_os = "windows")]
+use std::fmt::Display;
+#[cfg(target_os = "windows")]
 use std::time::Instant;
 const USAGE: &str = "usage: audio_input [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir>";
 
@@ -49,19 +51,39 @@ async fn main() -> common::ExampleResult<()> {
     let (microphone_input, mut events, worker) = session.into_parts();
     let output_monitor = events.monitor();
 
-    let mut captures = vec![microphone_device.start(session_started, microphone_input)?];
-    if let (Some(device), Some(input)) = (system_device, system_input) {
-        captures.push(device.start(session_started, input)?);
-    }
-    println!("  Execution {execution}");
-
     let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
     ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
     })?;
 
+    let (capture_failure_tx, mut capture_failure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut captures = Vec::new();
+    let microphone_capture = match microphone_device.start(
+        session_started,
+        microphone_input,
+        capture_failure_tx.clone(),
+    ) {
+        Ok(capture) => capture,
+        Err(error) => {
+            return fail_after_startup(error, &mut events, Vec::new(), worker).await;
+        }
+    };
+    captures.push(microphone_capture);
+    if let (Some(device), Some(input)) = (system_device, system_input) {
+        match device.start(session_started, input, capture_failure_tx.clone()) {
+            Ok(capture) => captures.push(capture),
+            Err(error) => {
+                return fail_after_startup(error, &mut events, captures, worker).await;
+            }
+        }
+    }
+    drop(capture_failure_tx);
+    println!("  Execution {execution}");
+
     for capture in &captures {
-        capture.play()?;
+        if let Err(error) = capture.play() {
+            return fail_after_startup(error, &mut events, captures, worker).await;
+        }
     }
     let mode = if CAPTURE_SYSTEM_AUDIO {
         "microphone and system audio"
@@ -71,6 +93,9 @@ async fn main() -> common::ExampleResult<()> {
     println!("Transcribing {mode}...");
     let mut stopping = false;
     let mut next_backlog_warning = Some(32_usize);
+    let mut capture_failure = None;
+    let mut capture_failure_channel_open = true;
+    let mut transcription_failure = None;
 
     loop {
         if let Some(threshold) = next_backlog_warning {
@@ -91,30 +116,43 @@ async fn main() -> common::ExampleResult<()> {
 
         tokio::select! {
             _ = stop_rx.recv(), if !stopping => {
-                stopping = true;
-                for capture in &mut captures {
-                    capture.stop();
+                begin_stopping(&mut captures, &mut stopping);
+            }
+            failure = capture_failure_rx.recv(), if capture_failure_channel_open && capture_failure.is_none() => {
+                match failure {
+                    Some(failure) => {
+                        eprintln!("{failure}");
+                        capture_failure = Some(failure);
+                        begin_stopping(&mut captures, &mut stopping);
+                    }
+                    None => capture_failure_channel_open = false,
                 }
-                println!("Stopping...");
             }
             event = events.recv() => {
-                let Some(event) = event else {
-                    break;
-                };
-                if !print_event(event?, microphone_id, system_id) {
-                    break;
+                match event {
+                    Some(Ok(event)) => {
+                        if !print_event(event, microphone_id, system_id) {
+                            break;
+                        }
+                    }
+                    None => break,
+                    Some(Err(error)) => {
+                        transcription_failure = Some(error);
+                        begin_stopping(&mut captures, &mut stopping);
+                        break;
+                    }
                 }
             }
         }
     }
 
-    for capture in &mut captures {
-        capture.stop();
-    }
-    for capture in captures {
-        capture.join()?;
-    }
-    worker.await?;
+    let forwarding_failure = finish_captures(captures)
+        .err()
+        .map(|error| error.to_string());
+    let worker_failure = worker
+        .await
+        .err()
+        .map(|error| format!("transcription worker failed: {error}"));
     let metrics = output_monitor.metrics();
     println!(
         "Output stats: emitted={}, received={}, peak_pending={}, discarded={}, delivery_failures={}",
@@ -124,9 +162,80 @@ async fn main() -> common::ExampleResult<()> {
         metrics.discarded_events,
         metrics.delivery_failures,
     );
+
+    let mut failures = Vec::new();
+    if let Some(error) = transcription_failure {
+        failures.push(error.to_string());
+    }
+    if let Some(error) = &forwarding_failure {
+        failures.push(error.clone());
+    }
+    if let Some(error) = capture_failure
+        && !forwarding_failure
+            .as_ref()
+            .is_some_and(|forwarding| forwarding.contains(&error))
+    {
+        failures.push(error);
+    }
+    if let Some(error) = worker_failure {
+        failures.push(error);
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("; ").into());
+    }
     println!("Stopped.");
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn fail_after_startup(
+    primary: impl Display,
+    events: &mut yamabiko_asr::TranscriptEventReceiver,
+    captures: Vec<capture::Capture>,
+    worker: yamabiko_asr::TranscriptionWorker,
+) -> common::ExampleResult<()> {
+    let mut failures = vec![primary.to_string()];
+    if let Err(error) = finish_captures(captures) {
+        failures.push(format!("capture cleanup failed: {error}"));
+    }
+    events.close();
+    if let Err(error) = worker.await {
+        failures.push(format!(
+            "transcription worker failed during cleanup: {error}"
+        ));
+    }
+    Err(failures.join("; ").into())
+}
+
+#[cfg(target_os = "windows")]
+fn begin_stopping(captures: &mut [capture::Capture], stopping: &mut bool) {
+    if *stopping {
+        return;
+    }
+    *stopping = true;
+    for capture in captures {
+        capture.stop();
+    }
+    println!("Stopping...");
+}
+
+#[cfg(target_os = "windows")]
+fn finish_captures(mut captures: Vec<capture::Capture>) -> common::ExampleResult<()> {
+    for capture in &mut captures {
+        capture.stop();
+    }
+    let mut failures = Vec::new();
+    for capture in captures {
+        if let Err(error) = capture.join() {
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
