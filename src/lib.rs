@@ -42,8 +42,8 @@ mod vad;
 mod readme_doctests {}
 
 pub use builder::TranscriberBuilder;
+pub(crate) use config::TranscriberConfig;
 pub use config::{AudioSourceId, Device, PCM_SAMPLE_RATE_HZ};
-pub(crate) use config::{TranscriberConfig, VadConfig};
 pub use error::{Error, Result};
 pub use event::{SegmentId, SpeakerId, TranscriptEvent, TranscriptSegment};
 pub use session::{
@@ -51,8 +51,8 @@ pub use session::{
     TranscriptionWorker,
 };
 
-use backend::ParakeetTdtModel;
 use session::{SessionCommand, output_channel, run_transcription_worker};
+use tdt::ParakeetTdtModel;
 use vad::{SileroVadFactory, VadFactory};
 
 /// A transcription engine backed by one loaded Parakeet ASR model.
@@ -74,9 +74,10 @@ impl Transcriber {
     /// Model loading is synchronous and may take long enough that GUI
     /// applications should call this away from their UI thread.
     pub(crate) fn new(config: TranscriberConfig) -> Result<Self> {
-        config.validate()?;
-        let model: Box<dyn backend::AsrModel> = Box::new(ParakeetTdtModel::load(&config)?);
-        let mut vad_factory = SileroVadFactory::new(config.vad.clone())?;
+        let vad_options = config.validate()?;
+        let model: Box<dyn backend::AsrModel> =
+            Box::new(ParakeetTdtModel::load(&config.model_dir, config.device)?);
+        let mut vad_factory = SileroVadFactory::new(vad_options)?;
         let vad = vad_factory.create()?;
         Ok(Self {
             input_capacity: config.input_capacity,

@@ -114,7 +114,7 @@ impl Default for VadConfig {
 }
 
 impl VadConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<SpeechOptions> {
         if !(0.0..=1.0).contains(&self.threshold) || !self.threshold.is_finite() {
             return Err(Error::InvalidConfig(
                 "VAD threshold must be a finite value from 0.0 to 1.0".to_string(),
@@ -144,12 +144,7 @@ impl VadConfig {
                 "VAD max_speech is too short for min_speech and speech_pad".to_string(),
             ));
         }
-        Ok(())
-    }
-
-    pub(crate) fn speech_options(&self) -> Result<SpeechOptions> {
-        self.validate()?;
-        Ok(self.options())
+        Ok(options)
     }
 
     fn options(&self) -> SpeechOptions {
@@ -184,7 +179,7 @@ impl TranscriberConfig {
         }
     }
 
-    pub(crate) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<SpeechOptions> {
         if self.model_dir.as_os_str().is_empty() {
             return Err(Error::InvalidConfig(
                 "model_dir must point to a local model directory".to_string(),

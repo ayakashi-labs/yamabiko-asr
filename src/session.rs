@@ -37,40 +37,36 @@ pub struct OutputMetrics {
     pub receiver_closed: bool,
 }
 
-#[derive(Debug, Default)]
-struct OutputCounters {
-    pending_events: usize,
-    peak_pending_events: usize,
-    emitted_events: u64,
-    received_events: u64,
-    discarded_events: u64,
-    delivery_failures: u64,
-    receiver_closed: bool,
+#[derive(Debug)]
+struct OutputState {
+    counters: Mutex<OutputMetrics>,
 }
 
-#[derive(Debug, Default)]
-struct OutputState {
-    counters: Mutex<OutputCounters>,
+impl Default for OutputState {
+    fn default() -> Self {
+        Self {
+            counters: Mutex::new(OutputMetrics {
+                pending_events: 0,
+                peak_pending_events: 0,
+                emitted_events: 0,
+                received_events: 0,
+                discarded_events: 0,
+                delivery_failures: 0,
+                receiver_closed: false,
+            }),
+        }
+    }
 }
 
 impl OutputState {
-    fn lock(&self) -> MutexGuard<'_, OutputCounters> {
+    fn lock(&self) -> MutexGuard<'_, OutputMetrics> {
         self.counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn metrics(&self) -> OutputMetrics {
-        let counters = self.lock();
-        OutputMetrics {
-            pending_events: counters.pending_events,
-            peak_pending_events: counters.peak_pending_events,
-            emitted_events: counters.emitted_events,
-            received_events: counters.received_events,
-            discarded_events: counters.discarded_events,
-            delivery_failures: counters.delivery_failures,
-            receiver_closed: counters.receiver_closed,
-        }
+        *self.lock()
     }
 
     fn record_received(&self, count: usize) {
@@ -663,7 +659,7 @@ pub(crate) fn run_transcription_worker(
                     return;
                 }
                 if sources.is_empty() {
-                    let _ = send_event(&event_tx, Ok(TranscriptEvent::EndOfStream));
+                    let _ = event_tx.send(Ok(TranscriptEvent::EndOfStream));
                     return;
                 }
             }
@@ -687,7 +683,7 @@ pub(crate) fn run_transcription_worker(
             return;
         }
     }
-    let _ = send_event(&event_tx, Ok(TranscriptEvent::EndOfStream));
+    let _ = event_tx.send(Ok(TranscriptEvent::EndOfStream));
 }
 
 struct SourceState {
@@ -841,9 +837,8 @@ fn send_transcript(
     *sink.next_segment_id = sink.next_segment_id.saturating_add(1);
     let start_sample = timeline_sample(source_id, timeline_offset_sample, transcript_start_sample)?;
     let end_sample = timeline_sample(source_id, timeline_offset_sample, transcript_end_sample)?;
-    send_event(
-        sink.event_tx,
-        Ok(TranscriptEvent::Segment(TranscriptSegment {
+    sink.event_tx
+        .send(Ok(TranscriptEvent::Segment(TranscriptSegment {
             id,
             source_id,
             speaker_id: None,
@@ -852,16 +847,11 @@ fn send_transcript(
             end: duration_from_samples(end_sample),
             inference_duration,
             is_final: true,
-        })),
-    )
-}
-
-fn send_event(event_tx: &EventSender, event: Result<TranscriptEvent>) -> Result<()> {
-    event_tx.send(event)
+        })))
 }
 
 fn fail(event_tx: &EventSender, err: Error) {
-    let _ = send_event(event_tx, Err(err));
+    let _ = event_tx.send(Err(err));
 }
 
 #[cfg(test)]

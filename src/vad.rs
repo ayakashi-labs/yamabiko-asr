@@ -1,5 +1,5 @@
-use crate::{Error, PCM_SAMPLE_RATE_HZ, Result, VadConfig};
-use silero::{SampleRate, Session, SpeechSegment, SpeechSegmenter, StreamState};
+use crate::{Error, PCM_SAMPLE_RATE_HZ, Result};
+use silero::{SampleRate, Session, SpeechOptions, SpeechSegment, SpeechSegmenter, StreamState};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -20,16 +20,15 @@ pub(crate) trait VadFactory: Send {
 }
 
 pub(crate) struct SileroVadFactory {
-    config: VadConfig,
+    options: SpeechOptions,
     session: Arc<Mutex<Session>>,
 }
 
 impl SileroVadFactory {
-    pub(crate) fn new(config: VadConfig) -> Result<Self> {
-        config.validate()?;
+    pub(crate) fn new(options: SpeechOptions) -> Result<Self> {
         let session = Session::bundled().map_err(|err| Error::Vad(err.to_string()))?;
         Ok(Self {
-            config,
+            options,
             session: Arc::new(Mutex::new(session)),
         })
     }
@@ -38,9 +37,9 @@ impl SileroVadFactory {
 impl VadFactory for SileroVadFactory {
     fn create(&mut self) -> Result<Box<dyn VadGate>> {
         Ok(Box::new(SileroVadGate::new(
-            self.config.clone(),
+            self.options.clone(),
             Arc::clone(&self.session),
-        )?))
+        )))
     }
 }
 
@@ -53,18 +52,17 @@ pub(crate) struct SileroVadGate {
 }
 
 impl SileroVadGate {
-    fn new(config: VadConfig, session: Arc<Mutex<Session>>) -> Result<Self> {
-        let options = config.speech_options()?;
+    fn new(options: SpeechOptions, session: Arc<Mutex<Session>>) -> Self {
         let stream = StreamState::new(SampleRate::Rate16k);
         let segmenter = SpeechSegmenter::new(options);
 
-        Ok(Self {
+        Self {
             session,
             stream,
             segmenter,
             buffer: PcmBuffer::default(),
             next_emit_sample: 0,
-        })
+        }
     }
 
     fn push_segment(&mut self, segment: SpeechSegment, out: &mut Vec<SpeechChunk>) -> Result<()> {
@@ -218,7 +216,7 @@ pub(crate) fn duration_from_samples(samples: u64) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::{PcmBuffer, SileroVadFactory, SileroVadGate, VadGate};
-    use crate::VadConfig;
+    use crate::config::VadConfig;
     use std::sync::Arc;
 
     #[test]
@@ -235,10 +233,10 @@ mod tests {
 
     #[test]
     fn source_gates_share_session_and_bound_silence_buffer() {
-        let config = VadConfig::default();
-        let factory = SileroVadFactory::new(config.clone()).unwrap();
-        let mut gate = SileroVadGate::new(config.clone(), Arc::clone(&factory.session)).unwrap();
-        let second = SileroVadGate::new(config, Arc::clone(&factory.session)).unwrap();
+        let options = VadConfig::default().validate().unwrap();
+        let factory = SileroVadFactory::new(options.clone()).unwrap();
+        let mut gate = SileroVadGate::new(options.clone(), Arc::clone(&factory.session));
+        let second = SileroVadGate::new(options, Arc::clone(&factory.session));
         assert!(Arc::ptr_eq(&gate.session, &second.session));
         drop(second);
 
@@ -256,9 +254,9 @@ mod tests {
 
     #[test]
     fn final_segment_is_clamped_to_supplied_pcm() {
-        let config = VadConfig::default();
-        let factory = SileroVadFactory::new(config.clone()).unwrap();
-        let mut gate = SileroVadGate::new(config, Arc::clone(&factory.session)).unwrap();
+        let options = VadConfig::default().validate().unwrap();
+        let factory = SileroVadFactory::new(options.clone()).unwrap();
+        let mut gate = SileroVadGate::new(options, Arc::clone(&factory.session));
         gate.buffer.append(0, &[1.0; 100]);
 
         let mut chunks = Vec::new();
