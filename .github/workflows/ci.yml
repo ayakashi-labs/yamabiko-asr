@@ -16,6 +16,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -32,6 +37,9 @@ jobs:
 
       - name: Run documentation tests
         run: cargo test --locked --doc --all-features
+
+      - name: Test model export helpers
+        run: python tools/test_parakeet_export.py
 
       - name: Check package contents
         run: cargo package --locked
