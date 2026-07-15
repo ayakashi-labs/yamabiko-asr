@@ -226,41 +226,29 @@ fn spawn_forwarder(
     failure_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> JoinHandle<ExampleResult<()>> {
     std::thread::spawn(move || {
-        let forward_result = match forward_audio(&input, sample_rate, pcm_rx, &failure) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let (_, message) = report_failure(
-                    label,
-                    "forwarding",
-                    &error.to_string(),
-                    &failure,
-                    &failure_tx,
-                );
-                Err(message.into())
-            }
-        };
+        let forward_result =
+            forward_audio(&input, sample_rate, pcm_rx, &failure).map_err(|error| {
+                let error = error.to_string();
+                let message = forwarding_failure_message(label, &error, &failure);
+                notify_failure(message.clone(), &failure, &failure_tx);
+                message.into()
+            });
         let close_result = input.blocking_close();
         let result: ExampleResult<()> = match (forward_result, close_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(format!("failed to close input: {error}").into()),
+            (Ok(()), Err(error)) => {
+                Err(format!("{label} forwarding failed: failed to close input: {error}").into())
+            }
             (Err(forward_error), Err(close_error)) => Err(format!(
                 "{forward_error}; additionally failed to close input: {close_error}"
             )
             .into()),
         };
         if let Err(error) = result {
-            if failure.message().is_none() {
-                let (_, message) = report_failure(
-                    label,
-                    "forwarding",
-                    &error.to_string(),
-                    &failure,
-                    &failure_tx,
-                );
-                return Err(message.into());
-            }
-            return Err(error);
+            let message = error.to_string();
+            notify_failure(message.clone(), &failure, &failure_tx);
+            return Err(message.into());
         }
         Ok(())
     })
@@ -323,25 +311,30 @@ fn report_capture_failure(
     failure_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     pcm_tx: &SyncSender<CaptureMessage>,
 ) {
-    if report_failure(label, "capture", &message, failure, failure_tx).0 {
+    let message = format!("{label} capture failed: {message}");
+    if notify_failure(message, failure, failure_tx) {
         let _ = pcm_tx.try_send(CaptureMessage::Wake);
     }
 }
 
-fn report_failure(
-    label: &str,
-    operation: &str,
-    message: &str,
+fn notify_failure(
+    message: String,
     failure: &CaptureFailure,
     failure_tx: &tokio::sync::mpsc::UnboundedSender<String>,
-) -> (bool, String) {
-    let message = format!("{label} {operation} failed: {message}");
+) -> bool {
     let recorded = failure.record(message.clone());
-    let message = failure.message().unwrap_or(&message).to_string();
     if recorded {
-        let _ = failure_tx.send(message.clone());
+        let _ = failure_tx.send(message);
     }
-    (recorded, message)
+    recorded
+}
+
+fn forwarding_failure_message(label: &str, error: &str, failure: &CaptureFailure) -> String {
+    if failure.message() == Some(error) {
+        error.to_string()
+    } else {
+        format!("{label} forwarding failed: {error}")
+    }
 }
 
 fn send_complete_chunks(
@@ -414,15 +407,9 @@ mod tests {
         let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pcm_tx, _pcm_rx) = std::sync::mpsc::sync_channel(1);
 
-        let (recorded, message) = report_failure(
-            "microphone",
-            "forwarding",
-            "ASR input closed",
-            &failure,
-            &failure_tx,
-        );
+        let message = "microphone forwarding failed: ASR input closed".to_string();
+        let recorded = notify_failure(message.clone(), &failure, &failure_tx);
         assert!(recorded);
-        assert_eq!(message, "microphone forwarding failed: ASR input closed");
 
         report_capture_failure(
             "microphone",
@@ -434,6 +421,27 @@ mod tests {
 
         assert_eq!(failure.message(), Some(message.as_str()));
         assert_eq!(failure_rx.try_recv().unwrap(), message);
+        assert!(failure_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn notification_winner_does_not_replace_local_forwarding_error() {
+        let failure = CaptureFailure::default();
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(notify_failure(
+            "microphone capture failed: queue full".to_string(),
+            &failure,
+            &failure_tx,
+        ));
+
+        let local = forwarding_failure_message("microphone", "ASR input closed", &failure);
+        assert_eq!(local, "microphone forwarding failed: ASR input closed");
+        assert!(!notify_failure(local.clone(), &failure, &failure_tx));
+
+        assert_eq!(
+            failure_rx.try_recv().unwrap(),
+            "microphone capture failed: queue full"
+        );
         assert!(failure_rx.try_recv().is_err());
     }
 }
