@@ -320,7 +320,7 @@ normal shutdown. `audio_file` remains the minimal `recv`-loop example.
 - The Japanese Parakeet TDT-CTC model is the currently verified model path;
   multilingual support remains experimental.
 - Events intentionally contain only VAD-final utterances. Partial transcript
-  updates are outside the scope of 0.3.0.
+  updates are outside the scope of 0.3.x.
 - Speaker diarization and speaker identification are planned but not
   implemented.
 - Long-running microphone/system clock-drift correction is planned but not

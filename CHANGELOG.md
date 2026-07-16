@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-16
+
+### Fixed
+
+- Matched local Parakeet TDT feature extraction to NeMo framing and
+  normalization, including centered STFT windows, valid-frame masking, and
+  encoder-length handling.
+- Validated ONNX graph inputs and outputs, vocabulary IDs, decoder logits, and
+  recurrent state tensors before consuming model data.
+- Hardened receiver cancellation and source-close races while preserving
+  lossless draining and the documented terminal event order.
+- Bounded the Windows live-capture PCM handoff and preserved capture,
+  forwarding, input-close, and worker failure causes during shutdown.
+- Rejected non-zero VAD durations that truncate to zero samples.
+
+### Changed
+
+- Added README Rust code blocks to the documentation-test CI gate.
+- Removed redundant internal model and pipeline wrapper state.
+
 ## [0.3.0] - 2026-07-15
 
 ### Breaking changes
@@ -84,7 +104,8 @@ All notable changes to this project are documented in this file.
 - Corrected 8-, 16-, 24-, and 32-bit integer WAV normalization.
 - Flushed and released each audio source independently.
 
-[Unreleased]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.1.0...v0.2.0
