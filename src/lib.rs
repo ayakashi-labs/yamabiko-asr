@@ -51,7 +51,7 @@ pub use session::{
     TranscriptionWorker,
 };
 
-use session::{SessionCommand, output_channel, run_transcription_worker};
+use session::{command_channel, output_channel, run_transcription_worker};
 use tdt::ParakeetTdtModel;
 use vad::{SileroVadFactory, VadFactory};
 
@@ -91,16 +91,15 @@ impl Transcriber {
     /// Start the Tokio-facing streaming input/output API.
     ///
     /// The worker runs on Tokio's blocking pool because ONNX inference is
-    /// synchronous. The input command channel is bounded to provide natural
-    /// backpressure; transcript events use an unbounded channel so closing an
-    /// input never depends on draining output concurrently.
+    /// synchronous. Audio commands have bounded capacity to provide natural
+    /// backpressure; control and transcript event delivery remain unbounded so
+    /// closing an input never depends on queue capacity or draining output.
     ///
     /// # Panics
     ///
     /// Panics when called outside a Tokio runtime.
     pub fn start(self) -> TranscriptionSession {
-        let (command_tx, command_rx) =
-            tokio::sync::mpsc::channel::<SessionCommand>(self.input_capacity);
+        let (command_tx, command_rx) = command_channel(self.input_capacity);
         let (event_tx, events, cancelled) = output_channel(command_tx.downgrade());
         let worker_cancelled = std::sync::Arc::clone(&cancelled);
         let worker = tokio::task::spawn_blocking(move || {
@@ -770,7 +769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_receiver_cancels_inference_with_full_command_queue() {
+    async fn dropping_receiver_cancels_inference_with_queued_audio() {
         let (started_tx, started_rx) = std_mpsc::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
         let transcriber = Transcriber {
@@ -795,9 +794,8 @@ mod tests {
         input.send(vec![0.1; 4]).await.unwrap();
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        // Fill the command queue while inference holds the worker. The
-        // receiver's best-effort Cancel command cannot be queued in this state,
-        // so the shared cancellation flag must still stop the worker.
+        // Queue more audio while inference holds the worker. Cancellation must
+        // stop the worker before it processes that pending audio.
         input.send(vec![0.2; 4]).await.unwrap();
         drop(events);
         release_tx.send(()).unwrap();
@@ -815,7 +813,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_partially_moved_last_input_closes_full_command_queue() {
+    async fn dropping_additional_input_closes_it_with_full_audio_queue() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let transcriber = Transcriber {
+            input_capacity: 1,
+            max_sources: 2,
+            model: Box::new(BlockingModel {
+                started: started_tx,
+                release: release_rx,
+            }),
+            vad: Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }]],
+            }),
+            vad_factory: Box::new(FakeVadFactory {
+                vads: vec![
+                    Box::new(FinishVad {
+                        chunks: vec![vad::SpeechChunk {
+                            samples: vec![0.2; 4],
+                            start_sample: 0,
+                            end_sample: 4,
+                        }],
+                    }),
+                    Box::new(FakeVad { chunks: Vec::new() }),
+                ],
+            }),
+        };
+        let mut session = transcriber.start();
+        let additional = session.open_source().await.unwrap();
+        let additional_id = additional.source_id();
+
+        session.input.send(vec![0.1; 4]).await.unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Fill the audio queue while inference holds the worker, then drop the
+        // additional input. Its ordered close command must not be lost.
+        additional.send(vec![0.2; 4]).await.unwrap();
+        drop(additional);
+        release_tx.send(()).unwrap();
+
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx.send(()).unwrap();
+
+        let first = session.events.recv().await.unwrap().unwrap();
+        let second = session.events.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            (first, second),
+            (
+                TranscriptEvent::Segment(TranscriptSegment {
+                    source_id: AudioSourceId::PRIMARY,
+                    ..
+                }),
+                TranscriptEvent::Segment(TranscriptSegment { source_id, .. })
+            ) if source_id == additional_id
+        ));
+
+        let replacement = session.open_source().await.unwrap();
+        assert_ne!(replacement.source_id(), additional_id);
+        replacement.close().await.unwrap();
+        session.input.close().await.unwrap();
+        assert!(matches!(
+            session.events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_partially_moved_last_input_closes_with_full_audio_queue() {
         let (started_tx, started_rx) = std_mpsc::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
         let transcriber = Transcriber {

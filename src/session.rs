@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::Handle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Join handle for the blocking transcription worker.
@@ -115,7 +116,7 @@ pub struct TranscriptEventReceiver {
     inner: mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
     monitor: OutputMonitor,
     cancelled: Arc<AtomicBool>,
-    commands: mpsc::WeakSender<SessionCommand>,
+    commands: mpsc::WeakUnboundedSender<SessionCommand>,
 }
 
 impl TranscriptEventReceiver {
@@ -123,7 +124,7 @@ impl TranscriptEventReceiver {
         inner: mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
         state: Arc<OutputState>,
         cancelled: Arc<AtomicBool>,
-        commands: mpsc::WeakSender<SessionCommand>,
+        commands: mpsc::WeakUnboundedSender<SessionCommand>,
     ) -> Self {
         Self {
             inner,
@@ -256,7 +257,7 @@ impl TranscriptEventReceiver {
         if !self.cancelled.swap(true, Ordering::AcqRel)
             && let Some(commands) = self.commands.upgrade()
         {
-            let _ = commands.try_send(SessionCommand::Cancel);
+            let _ = commands.send(SessionCommand::Cancel);
         }
     }
 }
@@ -270,16 +271,88 @@ impl Drop for TranscriptEventReceiver {
     }
 }
 
+/// FIFO command sender with bounded capacity for queued audio only.
+///
+/// Control commands bypass audio backpressure so dropping an input can always
+/// queue its close behind that input's previously accepted audio.
+#[derive(Clone, Debug)]
+pub(crate) struct CommandSender {
+    inner: mpsc::UnboundedSender<SessionCommand>,
+    audio_capacity: Arc<Semaphore>,
+    runtime: Handle,
+}
+
+pub(crate) fn command_channel(
+    audio_capacity: usize,
+) -> (CommandSender, mpsc::UnboundedReceiver<SessionCommand>) {
+    let (inner, receiver) = mpsc::unbounded_channel();
+    (
+        CommandSender {
+            inner,
+            audio_capacity: Arc::new(Semaphore::new(audio_capacity)),
+            runtime: Handle::current(),
+        },
+        receiver,
+    )
+}
+
+impl CommandSender {
+    fn send(&self, command: SessionCommand) -> Result<()> {
+        self.inner.send(command).map_err(|_| Error::StreamClosed)
+    }
+
+    async fn send_audio(
+        &self,
+        source_id: AudioSourceId,
+        timestamp: Option<Duration>,
+        samples: Vec<f32>,
+    ) -> Result<()> {
+        let capacity_permit = Arc::clone(&self.audio_capacity)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::StreamClosed)?;
+        self.send(SessionCommand::Audio {
+            source_id,
+            timestamp,
+            samples,
+            capacity_permit,
+        })
+    }
+
+    fn blocking_send_audio(
+        &self,
+        source_id: AudioSourceId,
+        timestamp: Option<Duration>,
+        samples: Vec<f32>,
+    ) -> Result<()> {
+        let capacity_permit = self
+            .runtime
+            .block_on(Arc::clone(&self.audio_capacity).acquire_owned())
+            .map_err(|_| Error::StreamClosed)?;
+        self.send(SessionCommand::Audio {
+            source_id,
+            timestamp,
+            samples,
+            capacity_permit,
+        })
+    }
+
+    pub(crate) fn downgrade(&self) -> mpsc::WeakUnboundedSender<SessionCommand> {
+        self.inner.downgrade()
+    }
+}
+
 /// Input handle for one registered audio source.
 ///
 /// The handle is intentionally not cloneable so each source has one explicit
 /// owner and one unambiguous end-of-stream operation.
-/// Call `close` or `blocking_close` explicitly; dropping the handle only makes
-/// a best-effort non-blocking close request.
+/// Dropping the handle queues an ordered non-blocking close request. Call
+/// `close` or `blocking_close` explicitly to wait for buffered output and
+/// observe any close error.
 #[derive(Debug)]
 pub struct AudioInput {
     source_id: AudioSourceId,
-    commands: mpsc::Sender<SessionCommand>,
+    commands: CommandSender,
     cancelled: Arc<AtomicBool>,
     closed: bool,
 }
@@ -287,7 +360,7 @@ pub struct AudioInput {
 impl AudioInput {
     pub(crate) fn new(
         source_id: AudioSourceId,
-        commands: mpsc::Sender<SessionCommand>,
+        commands: CommandSender,
         cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -326,13 +399,8 @@ impl AudioInput {
     async fn send_command(&self, timestamp: Option<Duration>, samples: Vec<f32>) -> Result<()> {
         self.ensure_active()?;
         self.commands
-            .send(SessionCommand::Audio {
-                source_id: self.source_id,
-                timestamp,
-                samples,
-            })
-            .await
-            .map_err(|_| Error::StreamClosed)?;
+            .send_audio(self.source_id, timestamp, samples)
+            .await?;
         self.ensure_active()
     }
 
@@ -360,12 +428,7 @@ impl AudioInput {
     fn blocking_send_command(&self, timestamp: Option<Duration>, samples: Vec<f32>) -> Result<()> {
         self.ensure_active()?;
         self.commands
-            .blocking_send(SessionCommand::Audio {
-                source_id: self.source_id,
-                timestamp,
-                samples,
-            })
-            .map_err(|_| Error::StreamClosed)?;
+            .blocking_send_audio(self.source_id, timestamp, samples)?;
         self.ensure_active()
     }
 
@@ -374,13 +437,10 @@ impl AudioInput {
     pub async fn close(mut self) -> Result<()> {
         self.ensure_active()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
-            .send(SessionCommand::CloseSource {
-                source_id: self.source_id,
-                reply: Some(reply_tx),
-            })
-            .await
-            .map_err(|_| Error::StreamClosed)?;
+        self.commands.send(SessionCommand::CloseSource {
+            source_id: self.source_id,
+            reply: Some(reply_tx),
+        })?;
         self.closed = true;
         reply_rx.await.map_err(|_| Error::StreamClosed)?
     }
@@ -393,12 +453,10 @@ impl AudioInput {
     pub fn blocking_close(mut self) -> Result<()> {
         self.ensure_active()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.commands
-            .blocking_send(SessionCommand::CloseSource {
-                source_id: self.source_id,
-                reply: Some(reply_tx),
-            })
-            .map_err(|_| Error::StreamClosed)?;
+        self.commands.send(SessionCommand::CloseSource {
+            source_id: self.source_id,
+            reply: Some(reply_tx),
+        })?;
         self.closed = true;
         reply_rx.blocking_recv().map_err(|_| Error::StreamClosed)?
     }
@@ -415,7 +473,7 @@ impl AudioInput {
 impl Drop for AudioInput {
     fn drop(&mut self) {
         if !self.closed && !self.cancelled.load(Ordering::Acquire) {
-            let _ = self.commands.try_send(SessionCommand::CloseSource {
+            let _ = self.commands.send(SessionCommand::CloseSource {
                 source_id: self.source_id,
                 reply: None,
             });
@@ -445,9 +503,7 @@ impl TranscriptionSession {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.input
             .commands
-            .send(SessionCommand::OpenSource { reply: reply_tx })
-            .await
-            .map_err(|_| Error::StreamClosed)?;
+            .send(SessionCommand::OpenSource { reply: reply_tx })?;
         let result = reply_rx.await.map_err(|_| Error::StreamClosed)?;
         self.input.ensure_active()?;
         let source_id = result?;
@@ -473,6 +529,7 @@ pub(crate) enum SessionCommand {
         source_id: AudioSourceId,
         timestamp: Option<Duration>,
         samples: Vec<f32>,
+        capacity_permit: OwnedSemaphorePermit,
     },
     CloseSource {
         source_id: AudioSourceId,
@@ -507,7 +564,7 @@ impl EventSender {
 }
 
 pub(crate) fn output_channel(
-    commands: mpsc::WeakSender<SessionCommand>,
+    commands: mpsc::WeakUnboundedSender<SessionCommand>,
 ) -> (EventSender, TranscriptEventReceiver, Arc<AtomicBool>) {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let state = Arc::new(OutputState::default());
@@ -527,7 +584,7 @@ pub(crate) fn run_transcription_worker(
     mut model: Box<dyn AsrModel>,
     primary_vad: Box<dyn VadGate>,
     mut vad_factory: Box<dyn VadFactory>,
-    mut command_rx: mpsc::Receiver<SessionCommand>,
+    mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
     event_tx: EventSender,
     cancelled: Arc<AtomicBool>,
 ) {
@@ -599,7 +656,9 @@ pub(crate) fn run_transcription_worker(
                 source_id,
                 timestamp,
                 samples,
+                capacity_permit,
             } => {
+                drop(capacity_permit);
                 let Some(source) = sources
                     .iter_mut()
                     .find(|(id, _)| *id == source_id)
@@ -853,15 +912,15 @@ fn fail(event_tx: &EventSender, err: Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::poll_fn;
+    use std::future::{Future, poll_fn};
 
     fn test_output_channel() -> (
         EventSender,
         TranscriptEventReceiver,
         OutputMonitor,
-        mpsc::Sender<SessionCommand>,
+        mpsc::UnboundedSender<SessionCommand>,
     ) {
-        let (command_tx, _command_rx) = mpsc::channel(4);
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
         let (event_tx, events, _cancelled) = output_channel(command_tx.downgrade());
         let monitor = events.monitor();
         (event_tx, events, monitor, command_tx)
@@ -982,7 +1041,7 @@ mod tests {
 
     #[test]
     fn closing_receiver_sets_cancellation_before_metrics_lock() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
         let (_event_tx, mut events, cancelled) = output_channel(command_tx.downgrade());
         let monitor = events.monitor();
         let metrics_guard = monitor.state.lock();
@@ -1008,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_close_uses_worker_reply_as_its_linearization_point() {
-        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (command_tx, mut command_rx) = command_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let input = AudioInput::new(AudioSourceId::PRIMARY, command_tx, Arc::clone(&cancelled));
 
@@ -1022,6 +1081,71 @@ mod tests {
 
         assert_eq!(input.close().await, Ok(()));
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn audio_send_waits_for_available_capacity() {
+        let (command_tx, mut command_rx) = command_channel(1);
+        command_tx
+            .send_audio(AudioSourceId::PRIMARY, None, vec![0.1])
+            .await
+            .unwrap();
+        let mut second_send =
+            Box::pin(command_tx.send_audio(AudioSourceId::PRIMARY, None, vec![0.2]));
+        poll_fn(|cx| {
+            assert!(second_send.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let SessionCommand::Audio {
+            capacity_permit,
+            samples,
+            ..
+        } = command_rx.recv().await.unwrap()
+        else {
+            panic!("expected first audio command");
+        };
+        assert_eq!(samples, vec![0.1]);
+        drop(capacity_permit);
+
+        second_send.await.unwrap();
+        let SessionCommand::Audio {
+            capacity_permit,
+            samples,
+            ..
+        } = command_rx.recv().await.unwrap()
+        else {
+            panic!("expected second audio command");
+        };
+        assert_eq!(samples, vec![0.2]);
+        drop(capacity_permit);
+    }
+
+    #[tokio::test]
+    async fn blocking_audio_send_works_from_capture_thread() {
+        let (command_tx, mut command_rx) = command_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            let result = command_tx.blocking_send_audio(AudioSourceId::PRIMARY, None, vec![0.1]);
+            result_tx.send(result).unwrap();
+        });
+
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        let SessionCommand::Audio {
+            capacity_permit,
+            samples,
+            ..
+        } = command_rx.try_recv().unwrap()
+        else {
+            panic!("expected audio command");
+        };
+        assert_eq!(samples, vec![0.1]);
+        drop(capacity_permit);
+        sender.join().unwrap();
     }
 
     #[test]
@@ -1079,7 +1203,7 @@ mod tests {
 
     #[test]
     fn receiver_and_monitor_do_not_add_strong_command_senders() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
         assert_eq!(command_tx.strong_count(), 1);
 
         let (_event_tx, events, _cancelled) = output_channel(command_tx.downgrade());
