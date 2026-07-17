@@ -121,6 +121,12 @@ Model loading and ONNX inference are synchronous. Build the `Transcriber` away
 from a GUI thread. `Transcriber::start` moves inference onto Tokio's blocking
 pool.
 
+`send`, `send_at`, `blocking_send`, and `blocking_send_at` report input
+acceptance, not transcription completion. `Ok(())` means the chunk was accepted
+by the session input queue. VAD, transcription, and timestamp validation happen
+after acceptance; their results and terminal errors arrive through the session's
+event receiver. Keep draining events until `EndOfStream` or an error.
+
 ## Multiple audio sources
 
 Additional sources share the loaded ASR and VAD models, but keep independent
