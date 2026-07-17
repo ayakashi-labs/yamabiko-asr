@@ -3,6 +3,7 @@ use crate::backend::AsrModel;
 use crate::event::{SegmentId, TranscriptEvent, TranscriptSegment};
 use crate::vad::{SpeechChunk, VadFactory, VadGate, duration_from_samples};
 use crate::{AudioSourceId, Error, Result};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
@@ -112,6 +113,8 @@ impl OutputMonitor {
 /// Output remains unbounded so closing audio inputs never depends on draining
 /// this receiver concurrently. Applications should use [`Self::monitor`] to
 /// detect a growing backlog and continuously drain long-running sessions.
+/// The receiver also implements [`futures_core::Stream`] with the same items as
+/// [`Self::recv`].
 pub struct TranscriptEventReceiver {
     inner: mpsc::UnboundedReceiver<Result<TranscriptEvent>>,
     monitor: OutputMonitor,
@@ -259,6 +262,14 @@ impl TranscriptEventReceiver {
         {
             let _ = commands.send(SessionCommand::Cancel);
         }
+    }
+}
+
+impl futures_core::Stream for TranscriptEventReceiver {
+    type Item = Result<TranscriptEvent>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().poll_recv(cx)
     }
 }
 
@@ -924,6 +935,7 @@ fn fail(event_tx: &EventSender, err: Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::future::{Future, poll_fn};
 
     fn test_output_channel() -> (
@@ -940,6 +952,18 @@ mod tests {
 
     fn end_event() -> Result<TranscriptEvent> {
         Ok(TranscriptEvent::EndOfStream)
+    }
+
+    #[tokio::test]
+    async fn receiver_stream_tracks_received_events_and_closure() {
+        let (event_tx, mut events, monitor, _command_tx) = test_output_channel();
+        event_tx.send(end_event()).unwrap();
+        drop(event_tx);
+
+        assert!(events.next().await.unwrap().is_ok());
+        assert_eq!(monitor.metrics().received_events, 1);
+        assert!(events.next().await.is_none());
+        assert_eq!(monitor.metrics().received_events, 1);
     }
 
     #[tokio::test]

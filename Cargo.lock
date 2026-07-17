@@ -1537,6 +1537,8 @@ version = "0.3.1"
 dependencies = [
  "cpal",
  "ctrlc",
+ "futures-core",
+ "futures-util",
  "hound",
  "ndarray",
  "ort",

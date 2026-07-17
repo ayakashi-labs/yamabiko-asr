@@ -204,6 +204,12 @@ With the `serde` feature enabled, `TranscriptEvent` and `TranscriptSegment`
 implement `Serialize` directly. Duration fields are serialized as `start_ms`,
 `end_ms`, and `inference_ms`, so a separate UI payload type is unnecessary.
 
+`TranscriptEventReceiver` implements
+`futures_core::Stream<Item = Result<TranscriptEvent>>`. Applications can use
+`StreamExt` from `futures-util`, `tokio-stream`, or another compatible utility
+crate to call `next` and compose transcript events with other asynchronous
+streams. The existing `recv` methods remain available.
+
 ### Output monitoring and cancellation
 
 `TranscriptEventReceiver::monitor` returns a cloneable `OutputMonitor`. Its
