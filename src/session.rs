@@ -380,6 +380,10 @@ impl AudioInput {
     ///
     /// The first un-timestamped chunk anchors the source at session time zero;
     /// later chunks continue from the preceding sample count.
+    ///
+    /// `Ok(())` means the chunk was accepted by the session input queue. It
+    /// does not mean VAD or transcription has completed. Processing failures
+    /// after acceptance are emitted through [`TranscriptionSession::events`].
     pub async fn send(&self, samples: Vec<f32>) -> Result<()> {
         self.send_command(None, samples).await
     }
@@ -390,8 +394,11 @@ impl AudioInput {
     /// The first explicit timestamp anchors this source; later explicit
     /// timestamps must equal the position implied by all previously sent
     /// samples after the same quantization.
-    /// Timestamp validation failures are emitted as terminal errors through
-    /// `TranscriptionSession::events` after this command is accepted.
+    ///
+    /// As with [`Self::send`], `Ok(())` only confirms that the chunk was
+    /// accepted by the session input queue. Timestamp validation and
+    /// processing failures after acceptance are emitted as terminal errors
+    /// through [`TranscriptionSession::events`].
     pub async fn send_at(&self, timestamp: Duration, samples: Vec<f32>) -> Result<()> {
         self.send_command(Some(timestamp), samples).await
     }
@@ -406,6 +413,10 @@ impl AudioInput {
 
     /// Send one f32 mono 16 kHz PCM chunk from a non-async capture thread.
     ///
+    /// Like [`Self::send`], `Ok(())` only confirms that the chunk was accepted
+    /// by the session input queue. Processing results and failures are
+    /// delivered through [`TranscriptionSession::events`].
+    ///
     /// # Panics
     ///
     /// Panics when called from an asynchronous execution context.
@@ -416,7 +427,8 @@ impl AudioInput {
     /// Send a timestamped chunk from a non-async capture thread.
     ///
     /// This has the same timeline requirements and terminal error reporting as
-    /// `send_at`.
+    /// [`Self::send_at`]. `Ok(())` only confirms that the chunk was accepted by
+    /// the session input queue.
     ///
     /// # Panics
     ///
