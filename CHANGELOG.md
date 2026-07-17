@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-17
+
+### Added
+
+- Implemented `futures_core::Stream` for `TranscriptEventReceiver`, enabling
+  composition with compatible `StreamExt` utilities while preserving output
+  metrics and cancellation behavior.
+
+### Changed
+
+- Clarified that `send`, `send_at`, and their blocking variants report input
+  queue acceptance rather than VAD or transcription completion, with later
+  processing and timestamp errors delivered through session events.
+
+### Fixed
+
+- Ensured dropping an audio input always queues an ordered source close even
+  when audio capacity is exhausted, so buffered speech is flushed and source
+  slots are released.
+- Preserved configured `input_capacity` backpressure for audio while allowing
+  close and other control commands to bypass audio capacity.
+
 ## [0.3.1] - 2026-07-16
 
 ### Fixed
@@ -104,7 +126,8 @@ All notable changes to this project are documented in this file.
 - Corrected 8-, 16-, 24-, and 32-bit integer WAV normalization.
 - Flushed and released each audio source independently.
 
-[Unreleased]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ayakashi-labs/yamabiko-asr/compare/v0.2.0...v0.2.1
