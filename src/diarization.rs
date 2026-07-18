@@ -1,4 +1,5 @@
 use crate::{AudioSourceId, Result};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DiarizationMode {
@@ -69,9 +70,14 @@ pub(crate) trait Diarizer: Send {
         source_id: AudioSourceId,
         samples: &[f32],
         start_sample: u64,
+        cancelled: &AtomicBool,
     ) -> Result<DiarizationOutput>;
 
-    fn finish(&mut self, source_id: AudioSourceId) -> Result<DiarizationOutput>;
+    fn finish(
+        &mut self,
+        source_id: AudioSourceId,
+        cancelled: &AtomicBool,
+    ) -> Result<DiarizationOutput>;
 }
 
 pub(crate) trait DiarizerFactory: Send {
@@ -93,7 +99,7 @@ pub(crate) mod fake {
     use super::{BackendSpeakerId, DiarizationOutput, DiarizedRegion, Diarizer, DiarizerFactory};
     use crate::{AudioSourceId, Error, Result};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
 
@@ -153,6 +159,7 @@ pub(crate) mod fake {
             source_id: AudioSourceId,
             samples: &[f32],
             start_sample: u64,
+            _cancelled: &AtomicBool,
         ) -> Result<DiarizationOutput> {
             self.pushes
                 .lock()
@@ -227,7 +234,11 @@ pub(crate) mod fake {
             }
         }
 
-        fn finish(&mut self, source_id: AudioSourceId) -> Result<DiarizationOutput> {
+        fn finish(
+            &mut self,
+            source_id: AudioSourceId,
+            _cancelled: &AtomicBool,
+        ) -> Result<DiarizationOutput> {
             let end_sample = *self.source_ends.get(&source_id).unwrap_or(&0);
             match &self.behavior {
                 Behavior::Flush { speakers } if end_sample > 0 => Ok(DiarizationOutput {

@@ -1184,6 +1184,7 @@ pub(crate) fn run_diarization_worker(
     session_tx: mpsc::UnboundedSender<SessionCommand>,
     job_capacity: Arc<Semaphore>,
     runtime: Handle,
+    cancelled: Arc<AtomicBool>,
 ) {
     let mut state = DiarizationWorkerState {
         factory,
@@ -1194,6 +1195,7 @@ pub(crate) fn run_diarization_worker(
         session_tx,
         job_capacity,
         runtime,
+        cancelled,
     };
 
     while let Some(command) = command_rx.blocking_recv() {
@@ -1247,6 +1249,7 @@ struct DiarizationWorkerState {
     session_tx: mpsc::UnboundedSender<SessionCommand>,
     job_capacity: Arc<Semaphore>,
     runtime: Handle,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl DiarizationWorkerState {
@@ -1289,7 +1292,7 @@ impl DiarizationWorkerState {
             .diarizer
             .as_deref_mut()
             .ok_or_else(|| Error::Backend("diarization model is not initialized".to_string()))?
-            .push(source_id, &samples, start_sample)?;
+            .push(source_id, &samples, start_sample, &self.cancelled)?;
         source.buffer.append(start_sample, samples)?;
         self.process_output(source_id, timeline_offset, output)
     }
@@ -1304,7 +1307,7 @@ impl DiarizationWorkerState {
             .diarizer
             .as_deref_mut()
             .ok_or_else(|| Error::Backend("diarization model is not initialized".to_string()))?
-            .finish(source_id)?;
+            .finish(source_id, &self.cancelled)?;
         self.process_output(source_id, timeline_offset, output)?;
 
         let source = self

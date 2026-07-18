@@ -37,6 +37,8 @@ mod error;
 mod event;
 mod ort_utils;
 mod session;
+#[allow(dead_code)]
+mod sortformer;
 mod tdt;
 mod vad;
 
@@ -128,6 +130,7 @@ impl Transcriber {
         let internal_tx = command_tx.internal_sender();
         let panic_tx = internal_tx.clone();
         let diarizer_factory = self.diarizer_factory;
+        let diarization_cancelled = std::sync::Arc::clone(&cancelled);
         let diarization_worker = std::thread::Builder::new()
             .name("yamabiko-diarization".to_string())
             .spawn(move || {
@@ -138,10 +141,11 @@ impl Transcriber {
                         internal_tx,
                         job_capacity,
                         runtime,
+                        diarization_cancelled,
                     );
                 }));
                 if result.is_err() {
-                    let _ = panic_tx.send(SessionCommand::DiarizationFailed(Error::Backend(
+                    let _ = panic_tx.send(SessionCommand::DiarizationFailed(Error::Diarization(
                         "diarization worker panicked".to_string(),
                     )));
                 }

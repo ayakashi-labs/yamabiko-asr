@@ -15,10 +15,14 @@ pub enum Error {
     DeviceUnavailable { device: Device, message: String },
     /// The ASR model could not be loaded.
     ModelLoad(String),
+    /// The speaker diarization model could not be loaded.
+    DiarizationModelLoad(String),
     /// VAD initialization or inference failed.
     Vad(String),
     /// ASR inference failed after model load.
     Backend(String),
+    /// Speaker diarization inference failed after model load.
+    Diarization(String),
     /// The session cannot accept another concurrently active source.
     SourceLimit { max_sources: usize },
     /// A command referenced a source that is no longer active.
@@ -47,8 +51,12 @@ impl fmt::Display for Error {
                 write!(f, "execution device {device} is unavailable: {message}")
             }
             Self::ModelLoad(message) => write!(f, "failed to load ASR model: {message}"),
+            Self::DiarizationModelLoad(message) => {
+                write!(f, "failed to load diarization model: {message}")
+            }
             Self::Vad(message) => write!(f, "VAD failed: {message}"),
             Self::Backend(message) => write!(f, "ASR backend failed: {message}"),
+            Self::Diarization(message) => write!(f, "speaker diarization failed: {message}"),
             Self::SourceLimit { max_sources } => {
                 write!(f, "audio source limit reached: max_sources={max_sources}")
             }

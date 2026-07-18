@@ -10,6 +10,22 @@ pub(crate) fn build_session(
     execution_providers: Vec<ExecutionProviderDispatch>,
     model_load_error: fn(String) -> Error,
 ) -> Result<Session> {
+    build_session_with_options(
+        model_path,
+        device,
+        execution_providers,
+        false,
+        model_load_error,
+    )
+}
+
+pub(crate) fn build_session_with_options(
+    model_path: &Path,
+    device: Device,
+    execution_providers: Vec<ExecutionProviderDispatch>,
+    disable_cpu_fallback: bool,
+    model_load_error: fn(String) -> Error,
+) -> Result<Session> {
     let mut builder = Session::builder()
         .map_err(|err| model_load_error(err.to_string()))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -18,6 +34,15 @@ pub(crate) fn build_session(
         .map_err(|err| model_load_error(err.to_string()))?
         .with_inter_threads(1)
         .map_err(|err| model_load_error(err.to_string()))?;
+
+    if disable_cpu_fallback {
+        builder = builder
+            .with_disable_cpu_fallback()
+            .map_err(|err| Error::DeviceUnavailable {
+                device,
+                message: err.to_string(),
+            })?;
+    }
 
     builder = builder
         .with_execution_providers(execution_providers)
@@ -29,6 +54,20 @@ pub(crate) fn build_session(
     builder
         .commit_from_file(model_path)
         .map_err(|err| model_load_error(err.to_string()))
+}
+
+pub(crate) fn require_outlet_set(
+    outlets: &[Outlet],
+    location: &str,
+    expected: &[&str],
+) -> std::result::Result<(), String> {
+    let actual = outlets.iter().map(Outlet::name).collect::<Vec<_>>();
+    if actual != expected {
+        return Err(format!(
+            "unexpected {location} names/order: expected {expected:?}, got {actual:?}"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn require_tensor<'a>(
