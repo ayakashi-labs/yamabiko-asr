@@ -625,14 +625,158 @@ def save_external_model(
         raise RuntimeError(f"ONNX export did not create external data file {data_path}")
 
 
-def convert_to_fp16(graph):
+def convert_to_fp16(
+    graph,
+    input_contract: dict[str, tuple[str, int]] = INPUT_CONTRACT,
+    output_contract: dict[str, tuple[str, int]] = OUTPUT_CONTRACT,
+):
     from onnxconverter_common import float16
 
-    return float16.convert_float_to_float16(
+    converted = float16.convert_float_to_float16(
         graph,
-        keep_io_types=True,
+        keep_io_types=False,
         disable_shape_infer=False,
     )
+    repair_internal_float_casts(converted)
+    return restore_fp32_external_io(converted, input_contract, output_contract)
+
+
+def repair_internal_float_casts(model) -> None:
+    """Align existing Cast targets with the converter's FP16 annotations.
+
+    onnxconverter-common converts intermediate value_info from FLOAT to
+    FLOAT16, but does not update an existing Cast node's integer `to`
+    attribute. Only rewrite Cast outputs that the converter itself annotated
+    as FP16; boundary casts inserted for blocked FP32 operators remain intact.
+    """
+    import onnx
+
+    graph = model.graph
+    fp16_values = {
+        value.name
+        for value in (*graph.value_info, *graph.output)
+        if value.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16
+    }
+    for node in graph.node:
+        if node.op_type != "Cast" or not any(
+            output in fp16_values for output in node.output
+        ):
+            continue
+        target = next(
+            (attribute for attribute in node.attribute if attribute.name == "to"),
+            None,
+        )
+        if target is not None and target.i == onnx.TensorProto.FLOAT:
+            target.i = onnx.TensorProto.FLOAT16
+
+
+def restore_fp32_external_io(
+    model,
+    input_contract: dict[str, tuple[str, int]],
+    output_contract: dict[str, tuple[str, int]],
+):
+    """Keep the converted graph internal to FP16 while exposing FP32 I/O.
+
+    onnxconverter-common's keep_io_types mode rewrites a graph output in place.
+    That is invalid when the same value is also consumed by an internal FP16
+    node, as Sortformer's chunk embedding output is. Converting the complete
+    graph first and adding explicit boundary casts keeps internal consumers on
+    a separate FP16 value.
+    """
+    import onnx
+
+    graph = model.graph
+    nodes = list(graph.node)
+    used_names = {
+        name
+        for node in nodes
+        for name in (*node.input, *node.output)
+        if name
+    }
+    used_names.update(value.name for value in graph.input)
+    used_names.update(value.name for value in graph.output)
+    used_names.update(value.name for value in graph.value_info)
+    used_names.update(value.name for value in graph.initializer)
+
+    def internal_name(name: str, boundary: str) -> str:
+        base = f"{name}__yamabiko_{boundary}_fp16"
+        candidate = base
+        suffix = 1
+        while candidate in used_names:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used_names.add(candidate)
+        return candidate
+
+    input_casts = []
+    for value in graph.input:
+        if input_contract.get(value.name, (None, 0))[0] != "float32":
+            continue
+        external_name = value.name
+        internal = internal_name(external_name, "input")
+        replaced = False
+        for node in nodes:
+            for index, name in enumerate(node.input):
+                if name == external_name:
+                    node.input[index] = internal
+                    replaced = True
+        if not replaced:
+            raise RuntimeError(f"FP16 graph input {external_name} has no consumers")
+        value.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+        input_casts.append(
+            onnx.helper.make_node(
+                "Cast",
+                [external_name],
+                [internal],
+                name=f"yamabiko.cast_input.{external_name}",
+                to=onnx.TensorProto.FLOAT16,
+            )
+        )
+
+    output_casts = []
+    for value in graph.output:
+        if output_contract.get(value.name, (None, 0))[0] != "float32":
+            continue
+        external_name = value.name
+        internal = internal_name(external_name, "output")
+        produced = False
+        for node in nodes:
+            for index, name in enumerate(node.output):
+                if name == external_name:
+                    node.output[index] = internal
+                    produced = True
+            for index, name in enumerate(node.input):
+                if name == external_name:
+                    node.input[index] = internal
+        if not produced:
+            raise RuntimeError(f"FP16 graph output {external_name} has no producer")
+        for intermediate in graph.value_info:
+            if intermediate.name == external_name:
+                intermediate.name = internal
+        value.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
+        output_casts.append(
+            onnx.helper.make_node(
+                "Cast",
+                [internal],
+                [external_name],
+                name=f"yamabiko.cast_output.{external_name}",
+                to=onnx.TensorProto.FLOAT,
+            )
+        )
+
+    del graph.node[:]
+    graph.node.extend(input_casts)
+    graph.node.extend(nodes)
+    graph.node.extend(output_casts)
+
+    # onnxconverter-common can leave stale FP32 annotations for values whose
+    # producers were converted to FP16 (notably the outputs of existing Cast
+    # nodes). Intermediate value_info entries are optional, and retaining an
+    # incorrect annotation makes ONNX's full shape inference reject an
+    # otherwise type-consistent graph. Drop them so the checker and runtimes
+    # infer the converted types from the nodes themselves.
+    del graph.value_info[:]
+    return model
 
 
 def tensor_element_type(value_info) -> str:

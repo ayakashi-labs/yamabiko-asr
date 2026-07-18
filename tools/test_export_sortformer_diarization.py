@@ -45,6 +45,69 @@ class ExporterContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             exporter.precision_metadata("int8")
 
+    def test_fp16_external_output_can_remain_an_internal_value(self) -> None:
+        try:
+            import onnx
+            from onnx import TensorProto, helper
+            import onnxconverter_common  # noqa: F401
+        except ImportError as error:
+            self.skipTest(f"optional ONNX conversion dependencies are missing: {error}")
+
+        left = helper.make_tensor_value_info("left", TensorProto.FLOAT, [1, 2])
+        right = helper.make_tensor_value_info("right", TensorProto.FLOAT, [1, 2])
+        shared = helper.make_tensor_value_info("shared", TensorProto.FLOAT, [1, 2])
+        combined = helper.make_tensor_value_info("combined", TensorProto.FLOAT, [1, 4])
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Cast", ["left"], ["casted"], to=TensorProto.FLOAT
+                ),
+                helper.make_node("Add", ["casted", "right"], ["shared"]),
+                helper.make_node("Concat", ["shared", "left"], ["combined"], axis=1),
+            ],
+            "shared-output",
+            [left, right],
+            [shared, combined],
+            value_info=[
+                helper.make_tensor_value_info("casted", TensorProto.FLOAT, [1, 2])
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", 17)],
+        )
+
+        converted = exporter.convert_to_fp16(
+            model,
+            {"left": ("float32", 2), "right": ("float32", 2)},
+            {"shared": ("float32", 2), "combined": ("float32", 2)},
+        )
+        onnx.checker.check_model(converted, full_check=True)
+        self.assertTrue(
+            all(
+                value.type.tensor_type.elem_type == TensorProto.FLOAT
+                for value in converted.graph.input
+            )
+        )
+        self.assertTrue(
+            all(
+                value.type.tensor_type.elem_type == TensorProto.FLOAT
+                for value in converted.graph.output
+            )
+        )
+        concat = next(node for node in converted.graph.node if node.op_type == "Concat")
+        self.assertNotIn("shared", concat.input)
+        original_cast = next(
+            node for node in converted.graph.node if node.output == ["casted"]
+        )
+        cast_target = next(
+            attribute.i
+            for attribute in original_cast.attribute
+            if attribute.name == "to"
+        )
+        self.assertEqual(cast_target, TensorProto.FLOAT16)
+        self.assertEqual(list(converted.graph.value_info), [])
+
     def test_model_source_describes_both_floating_point_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / exporter.SOURCE_FILENAME
