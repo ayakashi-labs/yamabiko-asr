@@ -28,12 +28,14 @@
 //! # }
 //! ```
 
+mod audio_features;
 mod backend;
 mod builder;
 mod config;
 mod diarization;
 mod error;
 mod event;
+mod ort_utils;
 mod session;
 mod tdt;
 mod vad;

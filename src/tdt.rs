@@ -1,10 +1,10 @@
+use crate::audio_features::{StftWorkspace, hann_window, slaney_mel_filterbank};
+use crate::ort_utils;
 use crate::{Device, Error, PCM_SAMPLE_RATE_HZ, Result};
 use ndarray::{Array2, Array3, Axis};
-use ort::ep::ExecutionProviderDispatch;
-use ort::session::{Session, SessionOutputs, builder::GraphOptimizationLevel};
-use ort::value::{DynValue, Outlet, TensorElementType, TensorRef, ValueType};
+use ort::session::{Session, SessionOutputs};
+use ort::value::{DynValue, Outlet, TensorElementType, TensorRef};
 use realfft::RealToComplex;
-use std::f32::consts::PI;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -54,10 +54,12 @@ impl ParakeetTdtModel {
         let encoder_contract = validate_encoder_contract(&encoder)?;
         validate_decoder_joint_contract(&decoder_joint, &encoder_contract, vocab.len())?;
         let word_boundary = word_boundary_for_vocab(&vocab);
-        let mel_basis = create_mel_filterbank(
+        let mel_basis = slaney_mel_filterbank(
             N_FFT,
             encoder_contract.feature_size,
             PCM_SAMPLE_RATE_HZ as usize,
+            0.0,
+            PCM_SAMPLE_RATE_HZ as f64 / 2.0,
         );
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_plan = planner.plan_fft_forward(N_FFT);
@@ -343,83 +345,7 @@ fn word_boundary_for_vocab(vocab: &[String]) -> WordBoundary {
 }
 
 fn build_session(model_path: &Path, device: Device) -> Result<Session> {
-    let mut builder = Session::builder()
-        .map_err(|err| Error::ModelLoad(err.to_string()))?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(|err| Error::ModelLoad(err.to_string()))?
-        .with_intra_threads(4)
-        .map_err(|err| Error::ModelLoad(err.to_string()))?
-        .with_inter_threads(1)
-        .map_err(|err| Error::ModelLoad(err.to_string()))?;
-
-    builder = builder
-        .with_execution_providers(execution_providers_for(device))
-        .map_err(|err| Error::DeviceUnavailable {
-            device,
-            message: err.to_string(),
-        })?;
-
-    builder
-        .commit_from_file(model_path)
-        .map_err(|err| Error::ModelLoad(err.to_string()))
-}
-
-fn execution_providers_for(device: Device) -> Vec<ExecutionProviderDispatch> {
-    let provider = match device {
-        Device::Cpu => return vec![cpu_provider()],
-        Device::Auto => return auto_execution_providers(),
-        Device::DirectMl => ort::ep::DirectML::default().build(),
-        Device::Cuda => ort::ep::CUDA::default().build(),
-        Device::TensorRt => {
-            return vec![
-                ort::ep::TensorRT::default().build().error_on_failure(),
-                ort::ep::CUDA::default().build(),
-                cpu_provider(),
-            ];
-        }
-        Device::OpenVino => ort::ep::OpenVINO::default().build(),
-        Device::Qnn => ort::ep::QNN::default().build(),
-        Device::VitisAi => ort::ep::Vitis::default().build(),
-        Device::NvRtx => ort::ep::NVRTX::default().build(),
-        Device::WebGpu => ort::ep::WebGPU::default().build(),
-        Device::Tvm => ort::ep::TVM::default().build(),
-        Device::Xnnpack => ort::ep::XNNPACK::default().build(),
-        Device::OneDnn => ort::ep::OneDNN::default().build(),
-    };
-
-    vec![provider.error_on_failure(), cpu_provider()]
-}
-
-fn auto_execution_providers() -> Vec<ExecutionProviderDispatch> {
-    vec![
-        #[cfg(feature = "nvrtx")]
-        ort::ep::NVRTX::default().build(),
-        #[cfg(feature = "tensorrt")]
-        ort::ep::TensorRT::default().build(),
-        #[cfg(feature = "cuda")]
-        ort::ep::CUDA::default().build(),
-        #[cfg(feature = "qnn")]
-        ort::ep::QNN::default().build(),
-        #[cfg(feature = "vitis")]
-        ort::ep::Vitis::default().build(),
-        #[cfg(feature = "openvino")]
-        ort::ep::OpenVINO::default().build(),
-        #[cfg(feature = "directml")]
-        ort::ep::DirectML::default().build(),
-        #[cfg(feature = "webgpu")]
-        ort::ep::WebGPU::default().build(),
-        #[cfg(feature = "tvm")]
-        ort::ep::TVM::default().build(),
-        #[cfg(feature = "xnnpack")]
-        ort::ep::XNNPACK::default().build(),
-        #[cfg(feature = "onednn")]
-        ort::ep::OneDNN::default().build(),
-        cpu_provider(),
-    ]
-}
-
-fn cpu_provider() -> ExecutionProviderDispatch {
-    ort::ep::CPU::default().build().error_on_failure()
+    ort_utils::build_session(model_path, device, Error::ModelLoad)
 }
 
 fn validate_encoder_contract(encoder: &Session) -> Result<EncoderContract> {
@@ -592,47 +518,19 @@ fn require_tensor<'a>(
     expected_rank: Option<usize>,
     expected_dimensions: &[(usize, usize)],
 ) -> Result<&'a [i64]> {
-    let outlet = outlets
-        .iter()
-        .find(|outlet| outlet.name() == name)
-        .ok_or_else(|| Error::ModelLoad(format!("{location} is missing '{name}'")))?;
-    let ValueType::Tensor { ty, shape, .. } = outlet.dtype() else {
-        return Err(Error::ModelLoad(format!(
-            "{location} '{name}' must be a tensor, got {}",
-            outlet.dtype()
-        )));
-    };
-    if *ty != expected_type {
-        return Err(Error::ModelLoad(format!(
-            "{location} '{name}' must contain {expected_type}, got {ty}"
-        )));
-    }
-    if let Some(expected_rank) = expected_rank
-        && shape.len() != expected_rank
-    {
-        return Err(Error::ModelLoad(format!(
-            "{location} '{name}' must have rank {expected_rank}, got shape {shape:?}"
-        )));
-    }
-    for &(index, expected) in expected_dimensions {
-        require_compatible_dimension(shape, index, expected, &format!("{location} '{name}'"))?;
-    }
-    Ok(shape.as_ref())
+    ort_utils::require_tensor(
+        outlets,
+        location,
+        name,
+        expected_type,
+        expected_rank,
+        expected_dimensions,
+    )
+    .map_err(Error::ModelLoad)
 }
 
 fn known_dimension(shape: &[i64], index: usize, label: &str) -> Result<Option<usize>> {
-    match shape.get(index).copied() {
-        Some(-1) => Ok(None),
-        Some(value) if value > 0 => usize::try_from(value)
-            .map(Some)
-            .map_err(|_| Error::ModelLoad(format!("{label} dimension is too large: {value}"))),
-        Some(value) => Err(Error::ModelLoad(format!(
-            "{label} dimension must be positive or dynamic, got {value}"
-        ))),
-        None => Err(Error::ModelLoad(format!(
-            "{label} dimension is missing from shape {shape:?}"
-        ))),
-    }
+    ort_utils::known_dimension(shape, index, label).map_err(Error::ModelLoad)
 }
 
 fn require_compatible_dimension(
@@ -641,14 +539,7 @@ fn require_compatible_dimension(
     expected: usize,
     label: &str,
 ) -> Result<()> {
-    if let Some(actual) = known_dimension(shape, index, label)?
-        && actual != expected
-    {
-        return Err(Error::ModelLoad(format!(
-            "{label} dimension {actual} does not match required size {expected}"
-        )));
-    }
-    Ok(())
+    ort_utils::require_compatible_dimension(shape, index, expected, label).map_err(Error::ModelLoad)
 }
 
 fn required_output<'a>(
@@ -813,26 +704,19 @@ fn stft_with_plan(
     let padded_len = audio.len().saturating_add(pad_amount * 2);
     let num_frames = (padded_len - n_fft) / hop_length + 1;
     let freq_bins = n_fft / 2 + 1;
-    let window_offset = (n_fft - window.len()) / 2;
     let mut spectrogram = Array2::<f32>::zeros((freq_bins, num_frames));
-    let mut input = vec![0.0; n_fft];
-    let mut output = plan.make_output_vec();
-    let mut scratch = plan.make_scratch_vec();
+    let mut workspace = StftWorkspace::new(plan.as_ref());
 
     for frame_idx in 0..num_frames {
-        let start = frame_idx * hop_length;
-        input.fill(0.0);
-        for (window_idx, &weight) in window.iter().enumerate() {
-            let fft_idx = window_offset + window_idx;
-            let padded_index = start + fft_idx;
-            if let Some(audio_index) = padded_index.checked_sub(pad_amount)
-                && let Some(&sample) = audio.get(audio_index)
-            {
-                input[fft_idx] = sample * weight;
-            }
-        }
-
-        plan.process_with_scratch(&mut input, &mut output, &mut scratch)
+        let center = frame_idx.saturating_mul(hop_length) as i128;
+        let output = workspace
+            .execute_centered(plan.as_ref(), window, center, |sample_index| {
+                usize::try_from(sample_index)
+                    .ok()
+                    .and_then(|index| audio.get(index))
+                    .copied()
+                    .unwrap_or(0.0)
+            })
             .map_err(|err| Error::Backend(format!("FFT failed: {err}")))?;
         for freq_idx in 0..freq_bins {
             spectrogram[[freq_idx, frame_idx]] = output[freq_idx].norm_sqr();
@@ -842,89 +726,13 @@ fn stft_with_plan(
     Ok(spectrogram)
 }
 
-fn hann_window(window_length: usize) -> Vec<f32> {
-    (0..window_length)
-        .map(|index| 0.5 - 0.5 * ((2.0 * PI * index as f32) / (window_length as f32 - 1.0)).cos())
-        .collect()
-}
-
-fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Array2<f32> {
-    let freq_bins = n_fft / 2 + 1;
-    let mut filterbank = Array2::<f32>::zeros((n_mels, freq_bins));
-    let fmax = sample_rate as f64 / 2.0;
-    let mel_min = hz_to_mel_slaney(0.0);
-    let mel_max = hz_to_mel_slaney(fmax);
-    let mel_points = (0..=n_mels + 1)
-        .map(|index| {
-            mel_to_hz_slaney(mel_min + (mel_max - mel_min) * index as f64 / (n_mels + 1) as f64)
-        })
-        .collect::<Vec<_>>();
-    let fft_freqs = (0..freq_bins)
-        .map(|index| index as f64 * sample_rate as f64 / n_fft as f64)
-        .collect::<Vec<_>>();
-    let fdiff = mel_points
-        .windows(2)
-        .map(|window| window[1] - window[0])
-        .collect::<Vec<_>>();
-
-    for mel_idx in 0..n_mels {
-        for (freq_idx, &freq) in fft_freqs.iter().enumerate() {
-            let lower = (freq - mel_points[mel_idx]) / fdiff[mel_idx];
-            let upper = (mel_points[mel_idx + 2] - freq) / fdiff[mel_idx + 1];
-            filterbank[[mel_idx, freq_idx]] = 0.0f64.max(lower.min(upper)) as f32;
-        }
-    }
-
-    for mel_idx in 0..n_mels {
-        let enorm = 2.0 / (mel_points[mel_idx + 2] - mel_points[mel_idx]);
-        for freq_idx in 0..freq_bins {
-            filterbank[[mel_idx, freq_idx]] *= enorm as f32;
-        }
-    }
-
-    filterbank
-}
-
-const F_SP: f64 = 200.0 / 3.0;
-const MIN_LOG_HZ: f64 = 1000.0;
-const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP;
-const LOG_STEP: f64 = 0.06875177742094912;
-
-fn hz_to_mel_slaney(hz: f64) -> f64 {
-    if hz < MIN_LOG_HZ {
-        hz / F_SP
-    } else {
-        MIN_LOG_MEL + (hz / MIN_LOG_HZ).ln() / LOG_STEP
-    }
-}
-
-fn mel_to_hz_slaney(mel: f64) -> f64 {
-    if mel < MIN_LOG_MEL {
-        mel * F_SP
-    } else {
-        MIN_LOG_HZ * ((mel - MIN_LOG_MEL) * LOG_STEP).exp()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ort::value::{Shape, SymbolicDimensions};
     use std::io::Cursor;
 
     fn parse_test_vocab(contents: &str) -> Result<Vec<String>> {
         parse_vocab(Cursor::new(contents))
-    }
-
-    fn tensor_outlet(name: &str, ty: TensorElementType, shape: &[i64]) -> Outlet {
-        Outlet::new(
-            name,
-            ValueType::Tensor {
-                ty,
-                shape: Shape::new(shape.iter().copied()),
-                dimension_symbols: SymbolicDimensions::empty(shape.len()),
-            },
-        )
     }
 
     #[test]
@@ -1004,14 +812,6 @@ mod tests {
     }
 
     #[test]
-    fn model_dimensions_accept_dynamic_and_reject_invalid_values() {
-        assert_eq!(known_dimension(&[-1, 80, -1], 0, "test").unwrap(), None);
-        assert_eq!(known_dimension(&[-1, 80, -1], 1, "test").unwrap(), Some(80));
-        assert!(known_dimension(&[-1, 0, -1], 1, "test").is_err());
-        assert!(known_dimension(&[-1, -2, -1], 1, "test").is_err());
-    }
-
-    #[test]
     fn decoder_logits_contract_uses_the_final_dimension_at_any_rank() {
         for shape in [&[7][..], &[1, 1, 7], &[1, 1, 1, 1, 7]] {
             assert_eq!(decoder_logits_size(shape, 5, true).unwrap(), Some(7));
@@ -1023,78 +823,6 @@ mod tests {
         assert!(decoder_logits_size(&[], 5, true).is_err());
         assert!(decoder_logits_size(&[2, 7], 5, true).is_err());
         assert!(decoder_logits_size(&[1, 5], 5, true).is_err());
-    }
-
-    #[test]
-    fn tensor_contract_checks_name_type_rank_and_static_dimensions() {
-        let valid = [tensor_outlet(
-            "audio_signal",
-            TensorElementType::Float32,
-            &[-1, 80, -1],
-        )];
-        assert_eq!(
-            require_tensor(
-                &valid,
-                "encoder input",
-                "audio_signal",
-                TensorElementType::Float32,
-                Some(3),
-                &[(0, 1)],
-            )
-            .unwrap(),
-            [-1, 80, -1]
-        );
-
-        assert!(
-            require_tensor(
-                &valid,
-                "encoder input",
-                "missing",
-                TensorElementType::Float32,
-                Some(3),
-                &[],
-            )
-            .is_err()
-        );
-        assert!(
-            require_tensor(
-                &valid,
-                "encoder input",
-                "audio_signal",
-                TensorElementType::Int32,
-                Some(3),
-                &[],
-            )
-            .is_err()
-        );
-        assert!(
-            require_tensor(
-                &valid,
-                "encoder input",
-                "audio_signal",
-                TensorElementType::Float32,
-                Some(2),
-                &[],
-            )
-            .is_err()
-        );
-
-        let incompatible = [tensor_outlet(
-            "audio_signal",
-            TensorElementType::Float32,
-            &[2, 80, -1],
-        )];
-        assert!(
-            require_tensor(
-                &incompatible,
-                "encoder input",
-                "audio_signal",
-                TensorElementType::Float32,
-                Some(3),
-                &[(0, 1)],
-            )
-            .is_err()
-        );
     }
 
     #[test]
