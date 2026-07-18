@@ -20,6 +20,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-pc-windows-msvc
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -27,8 +28,26 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      - name: Run tests
-        run: cargo test --locked --all-targets --all-features
+      - name: Run default tests
+        run: cargo test --locked --all-targets
+
+      - name: Run general provider tests
+        run: cargo test --locked --all-targets --features "directml,onednn,openvino,qnn,vitis,xnnpack,serde"
+
+      - name: Run CUDA and TensorRT tests
+        run: cargo test --locked --all-targets --features "tensorrt,serde"
+
+      - name: Run TensorRT RTX tests
+        run: cargo test --locked --all-targets --features "nvrtx,serde"
+
+      - name: Run WebGPU tests
+        run: cargo test --locked --all-targets --features "webgpu,serde"
+
+      - name: Link-check custom dynamic providers
+        run: cargo test --locked --all-targets --no-run --features "tvm,serde"
+
+      - name: Check Windows ARM64 providers
+        run: cargo check --locked --target aarch64-pc-windows-msvc --features "qnn,xnnpack,serde"
 
       - name: Run documentation tests
         run: cargo test --locked --doc --all-features

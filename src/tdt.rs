@@ -365,52 +365,57 @@ fn build_session(model_path: &Path, device: Device) -> Result<Session> {
 }
 
 fn execution_providers_for(device: Device) -> Vec<ExecutionProviderDispatch> {
-    match device {
-        Device::Cpu => vec![cpu_provider()],
-        Device::Auto => vec![
-            ort::ep::DirectML::default().build(),
-            ort::ep::CUDA::default().build(),
-            ort::ep::TensorRT::default().build(),
-            ort::ep::OpenVINO::default().build(),
-            ort::ep::ROCm::default().build(),
-            ort::ep::CoreML::default().build(),
-            ort::ep::XNNPACK::default().build(),
-            ort::ep::OneDNN::default().build(),
-            cpu_provider(),
-        ],
-        Device::DirectMl => vec![
-            ort::ep::DirectML::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-        Device::Cuda => vec![
-            ort::ep::CUDA::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-        Device::TensorRt => vec![
-            ort::ep::TensorRT::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-        Device::OpenVino => vec![
-            ort::ep::OpenVINO::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-        Device::Rocm => vec![
-            ort::ep::ROCm::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-        Device::CoreMl => vec![
-            ort::ep::CoreML::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-        Device::Xnnpack => vec![
-            ort::ep::XNNPACK::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-        Device::OneDnn => vec![
-            ort::ep::OneDNN::default().build().error_on_failure(),
-            cpu_provider(),
-        ],
-    }
+    let provider = match device {
+        Device::Cpu => return vec![cpu_provider()],
+        Device::Auto => return auto_execution_providers(),
+        Device::DirectMl => ort::ep::DirectML::default().build(),
+        Device::Cuda => ort::ep::CUDA::default().build(),
+        Device::TensorRt => {
+            return vec![
+                ort::ep::TensorRT::default().build().error_on_failure(),
+                ort::ep::CUDA::default().build(),
+                cpu_provider(),
+            ];
+        }
+        Device::OpenVino => ort::ep::OpenVINO::default().build(),
+        Device::Qnn => ort::ep::QNN::default().build(),
+        Device::VitisAi => ort::ep::Vitis::default().build(),
+        Device::NvRtx => ort::ep::NVRTX::default().build(),
+        Device::WebGpu => ort::ep::WebGPU::default().build(),
+        Device::Tvm => ort::ep::TVM::default().build(),
+        Device::Xnnpack => ort::ep::XNNPACK::default().build(),
+        Device::OneDnn => ort::ep::OneDNN::default().build(),
+    };
+
+    vec![provider.error_on_failure(), cpu_provider()]
+}
+
+fn auto_execution_providers() -> Vec<ExecutionProviderDispatch> {
+    vec![
+        #[cfg(feature = "nvrtx")]
+        ort::ep::NVRTX::default().build(),
+        #[cfg(feature = "tensorrt")]
+        ort::ep::TensorRT::default().build(),
+        #[cfg(feature = "cuda")]
+        ort::ep::CUDA::default().build(),
+        #[cfg(feature = "qnn")]
+        ort::ep::QNN::default().build(),
+        #[cfg(feature = "vitis")]
+        ort::ep::Vitis::default().build(),
+        #[cfg(feature = "openvino")]
+        ort::ep::OpenVINO::default().build(),
+        #[cfg(feature = "directml")]
+        ort::ep::DirectML::default().build(),
+        #[cfg(feature = "webgpu")]
+        ort::ep::WebGPU::default().build(),
+        #[cfg(feature = "tvm")]
+        ort::ep::TVM::default().build(),
+        #[cfg(feature = "xnnpack")]
+        ort::ep::XNNPACK::default().build(),
+        #[cfg(feature = "onednn")]
+        ort::ep::OneDNN::default().build(),
+        cpu_provider(),
+    ]
 }
 
 fn cpu_provider() -> ExecutionProviderDispatch {
