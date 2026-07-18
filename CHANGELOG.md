@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Removed the `coreml` and `rocm` Cargo features and the corresponding
+  `Device::CoreMl` and `Device::Rocm` variants because the crate targets native
+  Windows execution.
+
+### Added
+
+- Added public QNN, Vitis AI, TensorRT RTX, WebGPU, and TVM execution-provider
+  features and `Device` variants for supported native Windows targets.
+
+### Changed
+
+- Limited `Device::Auto` to enabled Windows-capable providers and prioritized
+  specialized vendor providers before broader GPU and CPU fallbacks.
+- Made the `tensorrt` feature enable CUDA and use it between TensorRT and CPU
+  in the fallback chain recommended by ONNX Runtime.
+- Configured TVM through `ort`'s dynamic loader because the standard Windows
+  binary does not export the TVM registration API.
+- Added `load-dynamic` for applications that supply a custom Windows ONNX
+  Runtime or combine providers that use separate `ort` binary distributions.
+- Documented the hardware, architecture, ONNX Runtime build, and vendor runtime
+  requirements for every public execution provider.
+
 ## [0.3.2] - 2026-07-17
 
 ### Added

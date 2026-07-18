@@ -262,21 +262,54 @@ long-running applications must continue draining events promptly.
 
 ## Cargo features
 
-| Feature | Purpose |
-| --- | --- |
-| `serde` | Implements `Serialize` for transcript events, segments, and identifiers. |
-| `directml` | Enables the ONNX Runtime DirectML execution provider. |
-| `cuda` | Enables the CUDA execution provider. |
-| `tensorrt` | Enables the TensorRT execution provider. |
-| `openvino` | Enables the OpenVINO execution provider. |
-| `rocm` | Enables the ROCm execution provider. |
-| `coreml` | Enables the Core ML execution provider. |
-| `xnnpack` | Enables the XNNPACK execution provider. |
-| `onednn` | Enables the oneDNN execution provider. |
+The execution-provider features cover providers that can execute at least part
+of a local Parakeet graph on native Windows. CPU execution is always available
+and does not require a feature.
+
+| Feature | `Device` | Windows target | Provider requirements |
+| --- | --- | --- | --- |
+| `directml` | `DirectMl` | DirectX 12 GPUs | A DirectML-enabled ONNX Runtime. |
+| `cuda` | `Cuda` | NVIDIA GPUs on x86-64 | Compatible CUDA and cuDNN libraries. |
+| `tensorrt` | `TensorRt` | NVIDIA GPUs on x86-64 | Compatible TensorRT and CUDA libraries; also enables the `cuda` feature for fallback. |
+| `openvino` | `OpenVino` | Intel CPUs, GPUs, and NPUs on x86-64 | An OpenVINO-enabled ONNX Runtime and matching OpenVINO runtime. |
+| `qnn` | `Qnn` | Qualcomm NPUs on ARM64 | A QNN-enabled ONNX Runtime and supported Qualcomm runtime. |
+| `vitis` | `VitisAi` | AMD Ryzen AI NPUs on x86-64 | A Vitis AI-enabled ONNX Runtime and Ryzen AI Software. |
+| `nvrtx` | `NvRtx` | NVIDIA RTX GPUs on x86-64 | TensorRT RTX provider libraries. The built-in upstream provider is deprecated in favor of its plugin. |
+| `webgpu` | `WebGpu` | D3D12-capable GPUs | A WebGPU-enabled ONNX Runtime with Dawn. |
+| `tvm` | `Tvm` | Hardware supported by the custom TVM build | A TVM-enabled `onnxruntime.dll`; this feature uses dynamic loading. |
+| `xnnpack` | `Xnnpack` | Windows CPUs on x86-64 or ARM64 | An XNNPACK-enabled ONNX Runtime. |
+| `onednn` | `OneDnn` | Windows CPUs on x86-64 | A oneDNN-enabled ONNX Runtime and its provider libraries. |
+| `load-dynamic` | N/A | Custom Windows runtimes | Loads `onnxruntime.dll` at runtime instead of linking an `ort` download. |
+| `serde` | N/A | All supported Windows targets | Implements `Serialize` for transcript events, segments, and identifiers. |
 
 The default build uses CPU execution. Selecting an explicit accelerator with
 `TranscriberBuilder::device` requires the matching Cargo feature and its
-runtime libraries. `Device::Auto` tries available providers before CPU.
+runtime libraries. A feature enables the `ort` integration but cannot install
+vendor drivers or guarantee that the selected ONNX Runtime binary contains the
+provider. Provider availability also does not guarantee that every node in a
+particular model is accelerated; unsupported nodes fall back to CPU.
+
+The `tvm` feature switches `ort` to dynamic loading because its standard
+Windows binary does not contain TVM. Place the custom `onnxruntime.dll` beside
+the executable or point `ORT_DYLIB_PATH` to it. Because `ort` is shared with the
+Silero VAD, that DLL must also provide the standard CPU provider and API 24.
+
+The downloaded WebGPU binary is a separate `ort` distribution and cannot be
+combined with the CUDA/TensorRT or standalone TensorRT RTX distribution. Such a
+combination requires `load-dynamic` and a custom DLL containing every selected
+provider. CUDA/TensorRT builds already include TensorRT RTX, so `nvrtx` can be
+combined with `cuda` or `tensorrt` without `load-dynamic`.
+
+`Device::Auto` tries only enabled features, in this order: TensorRT RTX,
+TensorRT, CUDA, QNN, Vitis AI, OpenVINO, DirectML, WebGPU, TVM, XNNPACK, oneDNN,
+then CPU. Enable only the providers intended for the distributed application
+and include all required provider DLLs beside the ONNX Runtime library.
+
+Core ML, ROCm, MIGraphX, NNAPI, Arm NN, Arm Compute Library, CANN, and RKNPU are
+not exposed because they do not target native Windows in the supported `ort`
+version. The Azure provider is also not exposed: it invokes Azure-specific
+custom operators and cannot execute or accelerate the local Parakeet graphs
+accepted by this crate.
 
 ## Repository examples
 

@@ -38,16 +38,32 @@ impl AudioSourceId {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Device {
+    /// Use the built-in ONNX Runtime CPU provider.
     #[default]
     Cpu,
+    /// Try enabled Windows-capable providers in priority order, then use CPU.
     Auto,
+    /// Use DirectML on a DirectX 12-capable GPU (`directml` feature).
     DirectMl,
+    /// Use an NVIDIA CUDA GPU (`cuda` feature).
     Cuda,
+    /// Use NVIDIA TensorRT with CUDA fallback (`tensorrt` feature).
     TensorRt,
+    /// Use OpenVINO on supported Intel hardware (`openvino` feature).
     OpenVino,
-    Rocm,
-    CoreMl,
+    /// Use a Qualcomm NPU on Windows ARM64 (`qnn` feature).
+    Qnn,
+    /// Use an AMD Ryzen AI NPU (`vitis` feature).
+    VitisAi,
+    /// Use NVIDIA TensorRT RTX on a supported RTX GPU (`nvrtx` feature).
+    NvRtx,
+    /// Use native WebGPU through Dawn (`webgpu` feature).
+    WebGpu,
+    /// Use a TVM-enabled ONNX Runtime build (`tvm` feature).
+    Tvm,
+    /// Use the XNNPACK CPU provider (`xnnpack` feature).
     Xnnpack,
+    /// Use the oneDNN CPU provider (`onednn` feature).
     OneDnn,
 }
 
@@ -60,8 +76,11 @@ impl fmt::Display for Device {
             Self::Cuda => f.write_str("cuda"),
             Self::TensorRt => f.write_str("tensorrt"),
             Self::OpenVino => f.write_str("openvino"),
-            Self::Rocm => f.write_str("rocm"),
-            Self::CoreMl => f.write_str("coreml"),
+            Self::Qnn => f.write_str("qnn"),
+            Self::VitisAi => f.write_str("vitis"),
+            Self::NvRtx => f.write_str("nvrtx"),
+            Self::WebGpu => f.write_str("webgpu"),
+            Self::Tvm => f.write_str("tvm"),
             Self::Xnnpack => f.write_str("xnnpack"),
             Self::OneDnn => f.write_str("onednn"),
         }
@@ -79,12 +98,15 @@ impl FromStr for Device {
             "cuda" => Ok(Self::Cuda),
             "tensorrt" | "trt" => Ok(Self::TensorRt),
             "openvino" | "ov" => Ok(Self::OpenVino),
-            "rocm" => Ok(Self::Rocm),
-            "coreml" => Ok(Self::CoreMl),
+            "qnn" => Ok(Self::Qnn),
+            "vitis" | "vitisai" => Ok(Self::VitisAi),
+            "nvrtx" => Ok(Self::NvRtx),
+            "webgpu" | "wgpu" => Ok(Self::WebGpu),
+            "tvm" => Ok(Self::Tvm),
             "xnnpack" => Ok(Self::Xnnpack),
             "onednn" | "dnnl" => Ok(Self::OneDnn),
             other => Err(Error::InvalidConfig(format!(
-                "unsupported device '{other}'; expected one of auto, cpu, directml, cuda, tensorrt, openvino, rocm, coreml, xnnpack, onednn"
+                "unsupported device '{other}'; expected one of auto, cpu, directml, cuda, tensorrt, openvino, qnn, vitis, nvrtx, webgpu, tvm, xnnpack, onednn"
             ))),
         }
     }

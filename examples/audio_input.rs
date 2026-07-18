@@ -15,7 +15,7 @@ use capture::{CaptureDevice, print_event};
 use std::fmt::Display;
 #[cfg(target_os = "windows")]
 use std::time::Instant;
-const USAGE: &str = "usage: audio_input [--device auto|cpu|directml|cuda|tensorrt|openvino|rocm|coreml|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir>";
+const USAGE: &str = "usage: audio_input [--device auto|cpu|directml|cuda|tensorrt|openvino|qnn|vitis|nvrtx|webgpu|tvm|xnnpack|onednn] [--vad-threshold VALUE] [--vad-min-speech-ms MS] [--vad-min-silence-ms MS] [--vad-speech-pad-ms MS] <model-dir>";
 
 // Choose one capture mode by commenting out one line and uncommenting the other.
 const CAPTURE_SYSTEM_AUDIO: bool = true; // microphone + system audio
