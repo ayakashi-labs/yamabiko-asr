@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -134,11 +136,46 @@ class ExporterContractTests(unittest.TestCase):
             work = cwd / "models" / "work"
             cwd.mkdir()
 
-            exporter.validate_output_paths(output, cache, work, cwd)
+            exporter.validate_output_paths(
+                output,
+                work,
+                {"model download cache": cache},
+                cwd,
+            )
             for unsafe in [cwd, root, output, output / "work", cache / "work"]:
                 with self.subTest(unsafe=unsafe):
                     with self.assertRaises(RuntimeError):
-                        exporter.validate_output_paths(output, cache, unsafe, cwd)
+                        exporter.validate_output_paths(
+                            output,
+                            unsafe,
+                            {"model download cache": cache},
+                            cwd,
+                        )
+
+    def test_work_directory_must_not_overlap_effective_cache_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            cwd = root / "repo"
+            output = root / "output"
+            cache = root / ".hf-cache"
+            work = root / ".nemo-cache"
+            cwd.mkdir()
+            environment = {
+                "HF_HOME": str(cache),
+                "NEMO_CACHE_DIR": str(work),
+                "MPLCONFIGDIR": str(root / ".mpl-cache"),
+                "NUMBA_CACHE_DIR": str(root / ".numba-cache"),
+            }
+
+            with patch.dict(os.environ, environment):
+                configured = exporter.configure_local_caches(cache)
+                with self.assertRaises(RuntimeError):
+                    exporter.validate_output_paths(
+                        output,
+                        work,
+                        configured,
+                        cwd,
+                    )
 
     def test_install_replaces_all_artifacts_on_repeated_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -179,6 +216,27 @@ class ExporterContractTests(unittest.TestCase):
                 exporter.install_staged_output(staged, output)
             for name in exporter.OUTPUT_FILENAMES:
                 self.assertEqual((output / name).read_text(encoding="utf-8"), "old")
+
+    def test_install_can_preserve_staged_artifacts_for_debugging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            staged = root / "staged"
+            staged.mkdir()
+            for name in exporter.OUTPUT_FILENAMES:
+                (staged / name).write_text("debug", encoding="utf-8")
+
+            exporter.install_staged_output(staged, output, keep_staged=True)
+
+            for name in exporter.OUTPUT_FILENAMES:
+                self.assertEqual(
+                    (output / name).read_text(encoding="utf-8"),
+                    "debug",
+                )
+                self.assertEqual(
+                    (staged / name).read_text(encoding="utf-8"),
+                    "debug",
+                )
 
 
 if __name__ == "__main__":

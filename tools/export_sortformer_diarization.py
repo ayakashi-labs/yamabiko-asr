@@ -173,12 +173,19 @@ def require_export_environment() -> dict[str, str]:
     return versions
 
 
-def configure_local_caches(cache_dir: Path) -> None:
+def configure_local_caches(cache_dir: Path) -> dict[str, Path]:
     cache_root = cache_dir.parent.resolve()
-    os.environ.setdefault("HF_HOME", str(cache_dir.resolve()))
-    os.environ.setdefault("NEMO_CACHE_DIR", str((cache_root / ".nemo-cache").resolve()))
-    os.environ.setdefault("MPLCONFIGDIR", str((cache_root / ".mpl-cache").resolve()))
-    os.environ.setdefault("NUMBA_CACHE_DIR", str((cache_root / ".numba-cache").resolve()))
+    defaults = {
+        "HF_HOME": cache_dir.resolve(),
+        "NEMO_CACHE_DIR": (cache_root / ".nemo-cache").resolve(),
+        "MPLCONFIGDIR": (cache_root / ".mpl-cache").resolve(),
+        "NUMBA_CACHE_DIR": (cache_root / ".numba-cache").resolve(),
+    }
+    configured = {"model download cache": cache_dir.resolve()}
+    for variable, default in defaults.items():
+        value = os.environ.setdefault(variable, str(default))
+        configured[f"{variable} cache"] = Path(value).expanduser().resolve()
+    return configured
 
 
 def paths_overlap(first: Path, second: Path) -> bool:
@@ -187,8 +194,8 @@ def paths_overlap(first: Path, second: Path) -> bool:
 
 def validate_output_paths(
     output_dir: Path,
-    cache_dir: Path,
     work_dir: Path,
+    cache_directories: dict[str, Path],
     current_directory: Path | None = None,
 ) -> None:
     cwd = (current_directory or Path.cwd()).resolve()
@@ -197,10 +204,11 @@ def validate_output_paths(
         raise RuntimeError(
             f"Refusing unsafe --work-dir {work_dir}: it contains the current directory"
         )
-    for label, path in {
+    protected_directories = {
         "output directory": output_dir,
-        "model cache": cache_dir,
-    }.items():
+        **cache_directories,
+    }
+    for label, path in protected_directories.items():
         if paths_overlap(work_dir, path):
             raise RuntimeError(
                 f"Refusing unsafe --work-dir {work_dir}: it overlaps {label} {path}"
@@ -839,7 +847,11 @@ def write_model_source(
     dest.write_text(content, encoding="utf-8", newline="\n")
 
 
-def install_staged_output(staged_dir: Path, output_dir: Path) -> list[Path]:
+def install_staged_output(
+    staged_dir: Path,
+    output_dir: Path,
+    keep_staged: bool = False,
+) -> list[Path]:
     missing = [
         name
         for name in OUTPUT_FILENAMES
@@ -853,7 +865,16 @@ def install_staged_output(staged_dir: Path, output_dir: Path) -> list[Path]:
     for name in OUTPUT_FILENAMES:
         source = staged_dir / name
         destination = output_dir / name
-        os.replace(source, destination)
+        if keep_staged:
+            temporary = output_dir / f".{name}.installing"
+            temporary.unlink(missing_ok=True)
+            try:
+                shutil.copy2(source, temporary)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        else:
+            os.replace(source, destination)
         installed.append(destination)
     return installed
 
@@ -869,9 +890,9 @@ def run() -> None:
     fp32_path = staged_dir / FP32_MODEL_FILENAME
     fp16_path = staged_dir / FP16_MODEL_FILENAME
 
-    validate_output_paths(output_dir, cache_dir, work_dir)
+    cache_directories = configure_local_caches(cache_dir)
+    validate_output_paths(output_dir, work_dir, cache_directories)
     export_environment = require_export_environment()
-    configure_local_caches(cache_dir)
 
     print(f"Downloading pinned model: {MODEL_ID}@{MODEL_REVISION}")
     archive, resolved_revision = download_source_model(cache_dir)
@@ -921,7 +942,11 @@ def run() -> None:
     )
     validate_cpu_parity(model, fp32_path)
 
-    installed = install_staged_output(staged_dir, output_dir)
+    installed = install_staged_output(
+        staged_dir,
+        output_dir,
+        keep_staged=args.keep_work_dir,
+    )
     if not args.keep_work_dir:
         shutil.rmtree(work_dir)
 
