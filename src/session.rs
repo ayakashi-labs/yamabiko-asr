@@ -48,6 +48,7 @@ pub struct OutputMetrics {
 #[derive(Debug)]
 struct OutputState {
     counters: Mutex<OutputMetrics>,
+    terminal_error_sent: AtomicBool,
 }
 
 impl Default for OutputState {
@@ -62,6 +63,7 @@ impl Default for OutputState {
                 delivery_failures: 0,
                 receiver_closed: false,
             }),
+            terminal_error_sent: AtomicBool::new(false),
         }
     }
 }
@@ -585,7 +587,6 @@ pub(crate) enum SessionCommand {
         job: TranscriptionJob,
         capacity_permit: OwnedSemaphorePermit,
     },
-    SpeakerActivity(SpeakerActivity),
     DiarizedSourceClosed {
         source_id: AudioSourceId,
         result: Result<()>,
@@ -619,6 +620,7 @@ pub(crate) struct TranscriptionJob {
     samples: Vec<f32>,
 }
 
+#[derive(Clone)]
 pub(crate) struct EventSender {
     inner: mpsc::UnboundedSender<Result<TranscriptEvent>>,
     state: Arc<OutputState>,
@@ -628,7 +630,17 @@ impl EventSender {
     fn send(&self, event: Result<TranscriptEvent>) -> Result<()> {
         // Hold the accounting lock across the non-blocking send so a receiver
         // cannot permanently decrement pending before this send increments it.
+        // The same lock serializes all producer clones around a terminal error
+        // so no activity or transcript can be queued after that error.
         let mut counters = self.state.lock();
+        if self.state.terminal_error_sent.load(Ordering::Relaxed) {
+            return Err(Error::StreamClosed);
+        }
+        if event.is_err() {
+            self.state
+                .terminal_error_sent
+                .store(true, Ordering::Relaxed);
+        }
         match self.inner.send(event) {
             Ok(()) => {
                 counters.pending_events = counters.pending_events.saturating_add(1);
@@ -918,14 +930,6 @@ pub(crate) fn run_transcription_worker(params: TranscriptionWorkerParams) {
                     return;
                 }
             }
-            SessionCommand::SpeakerActivity(activity) => {
-                if event_tx
-                    .send(Ok(TranscriptEvent::SpeakerActivity(activity)))
-                    .is_err()
-                {
-                    return;
-                }
-            }
             SessionCommand::DiarizedSourceClosed { source_id, result } => {
                 let Some(position) = sources.iter().position(|(id, _)| *id == source_id) else {
                     fail(&event_tx, Error::SourceNotFound { source_id });
@@ -1195,6 +1199,7 @@ pub(crate) fn run_diarization_worker(
     factory: Box<dyn DiarizerFactory>,
     mut command_rx: mpsc::UnboundedReceiver<DiarizationCommand>,
     session_tx: mpsc::UnboundedSender<SessionCommand>,
+    event_tx: EventSender,
     job_capacity: Arc<Semaphore>,
     runtime: Handle,
     cancelled: Arc<AtomicBool>,
@@ -1206,6 +1211,7 @@ pub(crate) fn run_diarization_worker(
         speaker_ids: HashMap::new(),
         next_speaker_id: 0,
         session_tx,
+        event_tx,
         job_capacity,
         runtime,
         cancelled,
@@ -1260,6 +1266,7 @@ struct DiarizationWorkerState {
     speaker_ids: HashMap<(AudioSourceId, BackendSpeakerId), SpeakerId>,
     next_speaker_id: u64,
     session_tx: mpsc::UnboundedSender<SessionCommand>,
+    event_tx: EventSender,
     job_capacity: Arc<Semaphore>,
     runtime: Handle,
     cancelled: Arc<AtomicBool>,
@@ -1362,6 +1369,7 @@ impl DiarizationWorkerState {
             speaker_ids,
             next_speaker_id,
             session_tx,
+            event_tx,
             job_capacity,
             runtime,
             ..
@@ -1449,14 +1457,12 @@ impl DiarizationWorkerState {
                 activity_speakers.push(speaker_id);
             }
             for speaker_id in &activity_speakers {
-                session_tx
-                    .send(SessionCommand::SpeakerActivity(SpeakerActivity {
-                        source_id,
-                        speaker_id: *speaker_id,
-                        start: duration_from_samples(start_sample),
-                        end: duration_from_samples(end_sample),
-                    }))
-                    .map_err(|_| Error::StreamClosed)?;
+                event_tx.send(Ok(TranscriptEvent::SpeakerActivity(SpeakerActivity {
+                    source_id,
+                    speaker_id: *speaker_id,
+                    start: duration_from_samples(start_sample),
+                    end: duration_from_samples(end_sample),
+                })))?;
             }
             let speaker_id = if activity_speakers.len() == 1 {
                 Some(activity_speakers[0])
@@ -1611,6 +1617,36 @@ mod tests {
 
     fn end_event() -> Result<TranscriptEvent> {
         Ok(TranscriptEvent::EndOfStream)
+    }
+
+    fn activity_event() -> Result<TranscriptEvent> {
+        Ok(TranscriptEvent::SpeakerActivity(SpeakerActivity {
+            source_id: AudioSourceId::PRIMARY,
+            speaker_id: SpeakerId::new(0),
+            start: Duration::ZERO,
+            end: Duration::from_millis(80),
+        }))
+    }
+
+    #[test]
+    fn terminal_error_seals_all_event_sender_clones() {
+        let (event_tx, mut events, monitor, _command_tx) = test_output_channel();
+        let activity_tx = event_tx.clone();
+
+        event_tx
+            .send(Err(Error::Backend("terminal".to_string())))
+            .unwrap();
+        assert!(activity_tx.send(activity_event()).is_err());
+        assert!(event_tx.send(end_event()).is_err());
+
+        assert!(events.try_recv().unwrap().is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let metrics = monitor.metrics();
+        assert_eq!(metrics.emitted_events, 1);
+        assert_eq!(metrics.delivery_failures, 0);
     }
 
     #[tokio::test]

@@ -150,6 +150,7 @@ impl Transcriber {
         let runtime = tokio::runtime::Handle::current();
         let internal_tx = command_tx.internal_sender();
         let panic_tx = internal_tx.clone();
+        let diarization_event_tx = event_tx.clone();
         let diarizer_factory = self.diarizer_factory;
         let diarization_cancelled = std::sync::Arc::clone(&cancelled);
         let diarization_worker = std::thread::Builder::new()
@@ -160,6 +161,7 @@ impl Transcriber {
                         diarizer_factory,
                         diarization_rx,
                         internal_tx,
+                        diarization_event_tx,
                         job_capacity,
                         runtime,
                         diarization_cancelled,
@@ -594,11 +596,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn speaker_activity_is_available_while_asr_is_still_running() {
+    async fn speaker_activities_are_available_while_asr_is_still_running() {
         let (started_tx, started_rx) = std_mpsc::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
         let (diarizer_factory, _, _, _) =
-            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeEach {
+            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeSplit {
                 speakers: vec![diarization::BackendSpeakerId::new(2)],
             });
         let transcriber = Transcriber {
@@ -619,18 +621,33 @@ mod tests {
 
         input.send(vec![0.3; 8]).await.unwrap();
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let activity = futures_util::FutureExt::now_or_never(events.recv())
-            .expect("speaker activity must not wait for ASR")
-            .unwrap()
-            .unwrap();
-        assert!(matches!(activity, TranscriptEvent::SpeakerActivity(_)));
+        let monitor = events.monitor();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while monitor.metrics().pending_events < 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            monitor.metrics().pending_events,
+            2,
+            "all finalized activity must be available while ASR is blocked"
+        );
+        for _ in 0..2 {
+            let activity = futures_util::FutureExt::now_or_never(events.recv())
+                .expect("speaker activity must not wait for ASR")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(activity, TranscriptEvent::SpeakerActivity(_)));
+        }
 
         release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
         input.close().await.unwrap();
-        assert!(matches!(
-            events.recv().await.unwrap().unwrap(),
-            TranscriptEvent::Segment(_)
-        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                events.recv().await.unwrap().unwrap(),
+                TranscriptEvent::Segment(_)
+            ));
+        }
         assert!(matches!(
             events.recv().await.unwrap().unwrap(),
             TranscriptEvent::EndOfStream

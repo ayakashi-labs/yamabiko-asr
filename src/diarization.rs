@@ -151,6 +151,9 @@ pub(crate) mod fake {
         FinalizeEach {
             speakers: Vec<BackendSpeakerId>,
         },
+        FinalizeSplit {
+            speakers: Vec<BackendSpeakerId>,
+        },
         FinalizeAfter {
             pushes: usize,
             speakers: Vec<BackendSpeakerId>,
@@ -224,6 +227,21 @@ pub(crate) mod fake {
                         .collect(),
                     finalized_until: end_sample,
                 }),
+                Behavior::FinalizeSplit { speakers } => {
+                    let midpoint = start_sample.saturating_add(samples.len() as u64 / 2);
+                    Ok(DiarizationOutput {
+                        regions: [(start_sample, midpoint), (midpoint, end_sample)]
+                            .into_iter()
+                            .filter(|(start, end)| start < end)
+                            .map(|(start_sample, end_sample)| DiarizedRegion {
+                                start_sample,
+                                end_sample,
+                                speakers: speakers.clone(),
+                            })
+                            .collect(),
+                        finalized_until: end_sample,
+                    })
+                }
                 Behavior::FinalizeAfter {
                     pushes,
                     speakers,
