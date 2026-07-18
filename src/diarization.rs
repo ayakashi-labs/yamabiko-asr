@@ -1,25 +1,44 @@
 use crate::{AudioSourceId, Result};
 use std::sync::atomic::AtomicBool;
 
+/// Whether one audio source uses speaker diarization.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum DiarizationMode {
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum DiarizationMode {
+    /// Route this source through the existing Silero VAD path.
     #[default]
     Off,
-    #[allow(dead_code)]
+    /// Route this source through the configured diarization model.
     On,
 }
 
+/// Options fixed for the lifetime of one audio source.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct AudioSourceOptions {
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct AudioSourceOptions {
     pub(crate) diarization: DiarizationMode,
 }
 
 impl AudioSourceOptions {
+    /// Create options with speaker diarization disabled.
+    pub const fn new() -> Self {
+        Self::OFF
+    }
+
+    /// Enable or disable speaker diarization for this source.
+    pub const fn diarization(mut self, mode: DiarizationMode) -> Self {
+        self.diarization = mode;
+        self
+    }
+
     pub(crate) const OFF: Self = Self {
         diarization: DiarizationMode::Off,
     };
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const ON: Self = Self {
         diarization: DiarizationMode::On,
     };
@@ -88,9 +107,34 @@ pub(crate) struct UnavailableDiarizerFactory;
 
 impl DiarizerFactory for UnavailableDiarizerFactory {
     fn create(&mut self) -> Result<Box<dyn Diarizer>> {
-        Err(crate::Error::Backend(
-            "diarization backend is not configured".to_string(),
+        Err(crate::Error::InvalidConfig(
+            "speaker diarization is not configured on this transcriber".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_options_default_to_diarization_off() {
+        assert_eq!(AudioSourceOptions::new(), AudioSourceOptions::default());
+        assert_eq!(
+            AudioSourceOptions::new().diarization(DiarizationMode::On),
+            AudioSourceOptions::ON
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn public_source_options_serialize_with_stable_names() {
+        let options = AudioSourceOptions::new().diarization(DiarizationMode::On);
+
+        assert_eq!(
+            serde_json::to_value(options).unwrap(),
+            serde_json::json!({ "diarization": "on" })
+        );
     }
 }
 
@@ -328,5 +372,11 @@ pub(crate) mod fake {
             },
             creates,
         )
+    }
+
+    pub(crate) fn retrying_factory(error: Error, behavior: Behavior) -> Parts {
+        let (mut factory, creates, opened, pushes) = factory(behavior);
+        factory.create_error = Some(error);
+        (factory, creates, opened, pushes)
     }
 }

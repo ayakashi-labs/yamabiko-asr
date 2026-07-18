@@ -1,4 +1,4 @@
-use crate::{Device, Result, Transcriber, TranscriberConfig};
+use crate::{Device, DiarizationConfig, Result, Transcriber, TranscriberConfig};
 use std::path::Path;
 use std::time::Duration;
 
@@ -55,6 +55,16 @@ impl TranscriberBuilder {
         self
     }
 
+    /// Configure optional streaming speaker diarization.
+    ///
+    /// The model is loaded lazily when the first source using diarization is
+    /// opened. Sources remain non-diarized unless explicitly enabled through
+    /// [`crate::AudioSourceOptions`].
+    pub fn diarization(mut self, config: DiarizationConfig) -> Self {
+        self.config.diarization = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<Transcriber> {
         Transcriber::new(self.config)
     }
@@ -94,12 +104,24 @@ mod tests {
         assert_eq!(config.vad.max_speech, Duration::from_secs(20));
         assert_eq!(config.input_capacity, 8);
         assert_eq!(config.max_sources, 4);
+        assert_eq!(config.diarization, None);
     }
 
     #[test]
     fn transcriber_builder_validates_before_model_load() {
         let err = Transcriber::builder("model")
             .vad_threshold(f32::NAN)
+            .build()
+            .err()
+            .unwrap();
+
+        assert!(matches!(err, Error::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn diarization_config_is_validated_before_asr_model_load() {
+        let err = Transcriber::builder("model")
+            .diarization(DiarizationConfig::new(""))
             .build()
             .err()
             .unwrap();

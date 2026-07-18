@@ -112,6 +112,49 @@ impl FromStr for Device {
     }
 }
 
+/// Configuration for optional streaming speaker diarization.
+///
+/// Model loading is deferred until the first audio source with
+/// [`crate::DiarizationMode::On`] is opened. The model directory must contain
+/// the converted Sortformer files appropriate for the selected device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiarizationConfig {
+    pub(crate) model_dir: PathBuf,
+    pub(crate) device: Option<Device>,
+}
+
+impl DiarizationConfig {
+    /// Configure speaker diarization from a local model directory.
+    pub fn new(model_dir: impl AsRef<Path>) -> Self {
+        Self {
+            model_dir: model_dir.as_ref().to_path_buf(),
+            device: None,
+        }
+    }
+
+    /// Select the device used by the diarization model.
+    ///
+    /// Without this call, diarization inherits the ASR device configured on
+    /// [`crate::TranscriberBuilder`].
+    pub fn device(mut self, device: Device) -> Self {
+        self.device = Some(device);
+        self
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.model_dir.as_os_str().is_empty() {
+            return Err(Error::InvalidConfig(
+                "diarization model_dir must point to a local model directory".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn effective_device(&self, asr_device: Device) -> Device {
+        self.device.unwrap_or(asr_device)
+    }
+}
+
 /// Voice activity detection settings.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct VadConfig {
@@ -193,6 +236,7 @@ pub(crate) struct TranscriberConfig {
     pub(crate) vad: VadConfig,
     pub(crate) input_capacity: usize,
     pub(crate) max_sources: usize,
+    pub(crate) diarization: Option<DiarizationConfig>,
 }
 
 impl TranscriberConfig {
@@ -203,6 +247,7 @@ impl TranscriberConfig {
             vad: VadConfig::default(),
             input_capacity: 32,
             max_sources: 2,
+            diarization: None,
         }
     }
 
@@ -222,6 +267,9 @@ impl TranscriberConfig {
                 "max_sources must be greater than zero".to_string(),
             ));
         }
+        if let Some(diarization) = &self.diarization {
+            diarization.validate()?;
+        }
         self.vad.validate()
     }
 }
@@ -235,6 +283,18 @@ mod tests {
         let mut config = TranscriberConfig::new("model");
         config.max_sources = 0;
         assert!(matches!(config.validate(), Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn diarization_device_defaults_to_asr_and_supports_override() {
+        let inherited = DiarizationConfig::new("diarization");
+        assert_eq!(
+            inherited.effective_device(Device::DirectMl),
+            Device::DirectMl
+        );
+
+        let overridden = inherited.device(Device::Cpu);
+        assert_eq!(overridden.effective_device(Device::DirectMl), Device::Cpu);
     }
 
     #[test]

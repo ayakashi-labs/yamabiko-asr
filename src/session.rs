@@ -4,7 +4,7 @@ use crate::diarization::{
     AudioSourceOptions, BackendSpeakerId, DiarizationMode, DiarizationOutput, Diarizer,
     DiarizerFactory,
 };
-use crate::event::{SegmentId, SpeakerId, TranscriptEvent, TranscriptSegment};
+use crate::event::{SegmentId, SpeakerActivity, SpeakerId, TranscriptEvent, TranscriptSegment};
 use crate::vad::{SpeechChunk, VadFactory, VadGate, duration_from_samples};
 use crate::{AudioSourceId, Error, Result};
 use std::collections::{HashMap, VecDeque};
@@ -23,9 +23,9 @@ pub type TranscriptionWorker = JoinHandle<()>;
 
 /// A point-in-time snapshot of transcript output delivery statistics.
 ///
-/// All transcript segments, terminal errors, and end-of-stream markers count
-/// as events. Counters saturate instead of wrapping when their numeric range is
-/// exhausted.
+/// All speaker activity, transcript segments, terminal errors, and
+/// end-of-stream markers count as events. Counters saturate instead of wrapping
+/// when their numeric range is exhausted.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputMetrics {
@@ -535,7 +535,11 @@ impl TranscriptionSession {
         self.open_source_with_options(AudioSourceOptions::OFF).await
     }
 
-    pub(crate) async fn open_source_with_options(
+    /// Register an additional audio source with fixed lifetime options.
+    ///
+    /// Enabling diarization may lazily load the configured model. If loading
+    /// fails, only this source creation is rejected and a later call may retry.
+    pub async fn open_source_with_options(
         &self,
         options: AudioSourceOptions,
     ) -> Result<AudioInput> {
@@ -581,6 +585,7 @@ pub(crate) enum SessionCommand {
         job: TranscriptionJob,
         capacity_permit: OwnedSemaphorePermit,
     },
+    SpeakerActivity(SpeakerActivity),
     DiarizedSourceClosed {
         source_id: AudioSourceId,
         result: Result<()>,
@@ -910,6 +915,14 @@ pub(crate) fn run_transcription_worker(params: TranscriptionWorkerParams) {
                 }
                 if let Err(err) = result {
                     fail(&event_tx, err);
+                    return;
+                }
+            }
+            SessionCommand::SpeakerActivity(activity) => {
+                if event_tx
+                    .send(Ok(TranscriptEvent::SpeakerActivity(activity)))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1417,9 +1430,12 @@ impl DiarizationWorkerState {
                         region.end_sample
                     ))
                 })?;
-            let speaker_id = if region.speakers.len() == 1 {
-                let key = (source_id, region.speakers[0]);
-                Some(match speaker_ids.get(&key) {
+            let start_sample = timeline_sample(source_id, timeline_offset, region.start_sample)?;
+            let end_sample = timeline_sample(source_id, timeline_offset, region.end_sample)?;
+            let mut activity_speakers = Vec::with_capacity(region.speakers.len());
+            for backend_speaker in region.speakers {
+                let key = (source_id, backend_speaker);
+                let speaker_id = match speaker_ids.get(&key) {
                     Some(id) => *id,
                     None => {
                         let id = SpeakerId::new(*next_speaker_id);
@@ -1429,7 +1445,21 @@ impl DiarizationWorkerState {
                         speaker_ids.insert(key, id);
                         id
                     }
-                })
+                };
+                activity_speakers.push(speaker_id);
+            }
+            for speaker_id in &activity_speakers {
+                session_tx
+                    .send(SessionCommand::SpeakerActivity(SpeakerActivity {
+                        source_id,
+                        speaker_id: *speaker_id,
+                        start: duration_from_samples(start_sample),
+                        end: duration_from_samples(end_sample),
+                    }))
+                    .map_err(|_| Error::StreamClosed)?;
+            }
+            let speaker_id = if activity_speakers.len() == 1 {
+                Some(activity_speakers[0])
             } else {
                 None
             };
@@ -1439,8 +1469,8 @@ impl DiarizationWorkerState {
             let job = TranscriptionJob {
                 source_id,
                 speaker_id,
-                start_sample: timeline_sample(source_id, timeline_offset, region.start_sample)?,
-                end_sample: timeline_sample(source_id, timeline_offset, region.end_sample)?,
+                start_sample,
+                end_sample,
                 samples,
             };
             session_tx

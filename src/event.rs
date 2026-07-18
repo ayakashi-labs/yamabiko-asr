@@ -19,8 +19,9 @@ impl SegmentId {
 
 /// Stable identifier for an anonymous or identified speaker.
 ///
-/// Speaker assignment is optional until a diarization or identification
-/// stage associates a segment with a speaker.
+/// Non-diarized and overlapping transcript segments intentionally have no
+/// speaker assignment. Diarized single-speaker segments use the same ID as
+/// their preceding [`SpeakerActivity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct SpeakerId(u64);
@@ -42,6 +43,8 @@ impl SpeakerId {
 /// Consumers should treat `Segment` as an upsert keyed by `SegmentId` so a
 /// future diarization or streaming decoder can revise text, timing, or speaker
 /// assignment without introducing a second update mechanism.
+/// `SpeakerActivity` is finalized and precedes the transcript produced from
+/// the same audio interval.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -50,8 +53,54 @@ impl SpeakerId {
     serde(tag = "type", content = "data", rename_all = "snake_case")
 )]
 pub enum TranscriptEvent {
+    /// Finalized speaker activity emitted before its corresponding transcript.
+    SpeakerActivity(SpeakerActivity),
     Segment(TranscriptSegment),
     EndOfStream,
+}
+
+/// One finalized speaker-active interval on the shared session timeline.
+///
+/// Adjacent intervals for the same source and speaker may be joined by the
+/// consumer. Overlapping speech is represented by one activity event per
+/// active speaker while the corresponding transcript remains unattributed.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct SpeakerActivity {
+    /// Audio source on which this speaker was active.
+    pub source_id: AudioSourceId,
+    /// Session-unique speaker identifier.
+    pub speaker_id: SpeakerId,
+    /// Activity start timestamp on the session timeline.
+    #[cfg_attr(
+        feature = "serde",
+        serde(rename = "start_ms", serialize_with = "serialize_duration_ms")
+    )]
+    pub start: Duration,
+    /// Activity end timestamp on the session timeline.
+    #[cfg_attr(
+        feature = "serde",
+        serde(rename = "end_ms", serialize_with = "serialize_duration_ms")
+    )]
+    pub end: Duration,
+}
+
+impl SpeakerActivity {
+    /// Activity start timestamp in milliseconds on the session timeline.
+    pub fn start_ms(&self) -> u64 {
+        duration_ms(self.start)
+    }
+
+    /// Activity end timestamp in milliseconds on the session timeline.
+    pub fn end_ms(&self) -> u64 {
+        duration_ms(self.end)
+    }
+
+    /// Activity duration in milliseconds.
+    pub fn duration_ms(&self) -> u64 {
+        duration_ms(self.end.saturating_sub(self.start))
+    }
 }
 
 /// One transcription segment on the shared session audio timeline.
@@ -143,5 +192,43 @@ mod tests {
         assert_eq!(segment.end_ms(), 2_500);
         assert_eq!(segment.duration_ms(), 1_266);
         assert_eq!(segment.inference_ms(), 140);
+    }
+
+    #[test]
+    fn speaker_activity_helpers_use_millisecond_timestamps() {
+        let activity = SpeakerActivity {
+            source_id: AudioSourceId::PRIMARY,
+            speaker_id: SpeakerId::new(7),
+            start: Duration::from_millis(400),
+            end: Duration::from_millis(1_250),
+        };
+
+        assert_eq!(activity.start_ms(), 400);
+        assert_eq!(activity.end_ms(), 1_250);
+        assert_eq!(activity.duration_ms(), 850);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn speaker_activity_serializes_like_existing_events() {
+        let event = TranscriptEvent::SpeakerActivity(SpeakerActivity {
+            source_id: AudioSourceId::PRIMARY,
+            speaker_id: SpeakerId::new(7),
+            start: Duration::from_millis(400),
+            end: Duration::from_millis(1_250),
+        });
+
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({
+                "type": "speaker_activity",
+                "data": {
+                    "source_id": 0,
+                    "speaker_id": 7,
+                    "start_ms": 400,
+                    "end_ms": 1250
+                }
+            })
+        );
     }
 }
