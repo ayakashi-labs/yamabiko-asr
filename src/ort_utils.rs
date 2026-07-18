@@ -7,6 +7,7 @@ use std::path::Path;
 pub(crate) fn build_session(
     model_path: &Path,
     device: Device,
+    execution_providers: Vec<ExecutionProviderDispatch>,
     model_load_error: fn(String) -> Error,
 ) -> Result<Session> {
     let mut builder = Session::builder()
@@ -19,7 +20,7 @@ pub(crate) fn build_session(
         .map_err(|err| model_load_error(err.to_string()))?;
 
     builder = builder
-        .with_execution_providers(execution_providers_for(device))
+        .with_execution_providers(execution_providers)
         .map_err(|err| Error::DeviceUnavailable {
             device,
             message: err.to_string(),
@@ -97,64 +98,6 @@ pub(crate) fn require_compatible_dimension(
         ));
     }
     Ok(())
-}
-
-fn execution_providers_for(device: Device) -> Vec<ExecutionProviderDispatch> {
-    let provider = match device {
-        Device::Cpu => return vec![cpu_provider()],
-        Device::Auto => return auto_execution_providers(),
-        Device::DirectMl => ort::ep::DirectML::default().build(),
-        Device::Cuda => ort::ep::CUDA::default().build(),
-        Device::TensorRt => {
-            return vec![
-                ort::ep::TensorRT::default().build().error_on_failure(),
-                ort::ep::CUDA::default().build(),
-                cpu_provider(),
-            ];
-        }
-        Device::OpenVino => ort::ep::OpenVINO::default().build(),
-        Device::Qnn => ort::ep::QNN::default().build(),
-        Device::VitisAi => ort::ep::Vitis::default().build(),
-        Device::NvRtx => ort::ep::NVRTX::default().build(),
-        Device::WebGpu => ort::ep::WebGPU::default().build(),
-        Device::Tvm => ort::ep::TVM::default().build(),
-        Device::Xnnpack => ort::ep::XNNPACK::default().build(),
-        Device::OneDnn => ort::ep::OneDNN::default().build(),
-    };
-
-    vec![provider.error_on_failure(), cpu_provider()]
-}
-
-fn auto_execution_providers() -> Vec<ExecutionProviderDispatch> {
-    vec![
-        #[cfg(feature = "nvrtx")]
-        ort::ep::NVRTX::default().build(),
-        #[cfg(feature = "tensorrt")]
-        ort::ep::TensorRT::default().build(),
-        #[cfg(feature = "cuda")]
-        ort::ep::CUDA::default().build(),
-        #[cfg(feature = "qnn")]
-        ort::ep::QNN::default().build(),
-        #[cfg(feature = "vitis")]
-        ort::ep::Vitis::default().build(),
-        #[cfg(feature = "openvino")]
-        ort::ep::OpenVINO::default().build(),
-        #[cfg(feature = "directml")]
-        ort::ep::DirectML::default().build(),
-        #[cfg(feature = "webgpu")]
-        ort::ep::WebGPU::default().build(),
-        #[cfg(feature = "tvm")]
-        ort::ep::TVM::default().build(),
-        #[cfg(feature = "xnnpack")]
-        ort::ep::XNNPACK::default().build(),
-        #[cfg(feature = "onednn")]
-        ort::ep::OneDNN::default().build(),
-        cpu_provider(),
-    ]
-}
-
-fn cpu_provider() -> ExecutionProviderDispatch {
-    ort::ep::CPU::default().build().error_on_failure()
 }
 
 #[cfg(test)]

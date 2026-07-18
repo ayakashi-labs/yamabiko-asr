@@ -2,6 +2,7 @@ use crate::audio_features::{StftWorkspace, hann_window, slaney_mel_filterbank};
 use crate::ort_utils;
 use crate::{Device, Error, PCM_SAMPLE_RATE_HZ, Result};
 use ndarray::{Array2, Array3, Axis};
+use ort::ep::ExecutionProviderDispatch;
 use ort::session::{Session, SessionOutputs};
 use ort::value::{DynValue, Outlet, TensorElementType, TensorRef};
 use realfft::RealToComplex;
@@ -345,7 +346,70 @@ fn word_boundary_for_vocab(vocab: &[String]) -> WordBoundary {
 }
 
 fn build_session(model_path: &Path, device: Device) -> Result<Session> {
-    ort_utils::build_session(model_path, device, Error::ModelLoad)
+    ort_utils::build_session(
+        model_path,
+        device,
+        execution_providers_for(device),
+        Error::ModelLoad,
+    )
+}
+
+fn execution_providers_for(device: Device) -> Vec<ExecutionProviderDispatch> {
+    let provider = match device {
+        Device::Cpu => return vec![cpu_provider()],
+        Device::Auto => return auto_execution_providers(),
+        Device::DirectMl => ort::ep::DirectML::default().build(),
+        Device::Cuda => ort::ep::CUDA::default().build(),
+        Device::TensorRt => {
+            return vec![
+                ort::ep::TensorRT::default().build().error_on_failure(),
+                ort::ep::CUDA::default().build(),
+                cpu_provider(),
+            ];
+        }
+        Device::OpenVino => ort::ep::OpenVINO::default().build(),
+        Device::Qnn => ort::ep::QNN::default().build(),
+        Device::VitisAi => ort::ep::Vitis::default().build(),
+        Device::NvRtx => ort::ep::NVRTX::default().build(),
+        Device::WebGpu => ort::ep::WebGPU::default().build(),
+        Device::Tvm => ort::ep::TVM::default().build(),
+        Device::Xnnpack => ort::ep::XNNPACK::default().build(),
+        Device::OneDnn => ort::ep::OneDNN::default().build(),
+    };
+
+    vec![provider.error_on_failure(), cpu_provider()]
+}
+
+fn auto_execution_providers() -> Vec<ExecutionProviderDispatch> {
+    vec![
+        #[cfg(feature = "nvrtx")]
+        ort::ep::NVRTX::default().build(),
+        #[cfg(feature = "tensorrt")]
+        ort::ep::TensorRT::default().build(),
+        #[cfg(feature = "cuda")]
+        ort::ep::CUDA::default().build(),
+        #[cfg(feature = "qnn")]
+        ort::ep::QNN::default().build(),
+        #[cfg(feature = "vitis")]
+        ort::ep::Vitis::default().build(),
+        #[cfg(feature = "openvino")]
+        ort::ep::OpenVINO::default().build(),
+        #[cfg(feature = "directml")]
+        ort::ep::DirectML::default().build(),
+        #[cfg(feature = "webgpu")]
+        ort::ep::WebGPU::default().build(),
+        #[cfg(feature = "tvm")]
+        ort::ep::TVM::default().build(),
+        #[cfg(feature = "xnnpack")]
+        ort::ep::XNNPACK::default().build(),
+        #[cfg(feature = "onednn")]
+        ort::ep::OneDNN::default().build(),
+        cpu_provider(),
+    ]
+}
+
+fn cpu_provider() -> ExecutionProviderDispatch {
+    ort::ep::CPU::default().build().error_on_failure()
 }
 
 fn validate_encoder_contract(encoder: &Session) -> Result<EncoderContract> {
