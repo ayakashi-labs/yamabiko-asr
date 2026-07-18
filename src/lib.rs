@@ -31,6 +31,7 @@
 mod backend;
 mod builder;
 mod config;
+mod diarization;
 mod error;
 mod event;
 mod session;
@@ -51,7 +52,11 @@ pub use session::{
     TranscriptionWorker,
 };
 
-use session::{command_channel, output_channel, run_transcription_worker};
+use diarization::{AudioSourceOptions, DiarizerFactory, UnavailableDiarizerFactory};
+use session::{
+    SessionCommand, TranscriptionWorkerParams, command_channel, output_channel,
+    run_diarization_worker, run_transcription_worker,
+};
 use tdt::ParakeetTdtModel;
 use vad::{SileroVadFactory, VadFactory};
 
@@ -66,6 +71,7 @@ pub struct Transcriber {
     model: Box<dyn backend::AsrModel>,
     vad: Box<dyn vad::VadGate>,
     vad_factory: Box<dyn VadFactory>,
+    diarizer_factory: Box<dyn DiarizerFactory>,
 }
 
 impl Transcriber {
@@ -85,6 +91,7 @@ impl Transcriber {
             model,
             vad,
             vad_factory: Box::new(vad_factory),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         })
     }
 
@@ -99,26 +106,92 @@ impl Transcriber {
     ///
     /// Panics when called outside a Tokio runtime.
     pub fn start(self) -> TranscriptionSession {
+        self.start_with_options(AudioSourceOptions::OFF)
+            .expect("the default non-diarized source is initialized during construction")
+    }
+
+    pub(crate) fn start_with_options(
+        self,
+        primary_options: AudioSourceOptions,
+    ) -> Result<TranscriptionSession> {
+        let wait_for_diarizer = matches!(
+            primary_options.diarization,
+            diarization::DiarizationMode::On
+        );
         let (command_tx, command_rx) = command_channel(self.input_capacity);
         let (event_tx, events, cancelled) = output_channel(command_tx.downgrade());
+        let (diarization_tx, diarization_rx) = tokio::sync::mpsc::unbounded_channel();
+        let job_capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(self.input_capacity));
+        let runtime = tokio::runtime::Handle::current();
+        let internal_tx = command_tx.internal_sender();
+        let panic_tx = internal_tx.clone();
+        let diarizer_factory = self.diarizer_factory;
+        let diarization_worker = std::thread::Builder::new()
+            .name("yamabiko-diarization".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_diarization_worker(
+                        diarizer_factory,
+                        diarization_rx,
+                        internal_tx,
+                        job_capacity,
+                        runtime,
+                    );
+                }));
+                if result.is_err() {
+                    let _ = panic_tx.send(SessionCommand::DiarizationFailed(Error::Backend(
+                        "diarization worker panicked".to_string(),
+                    )));
+                }
+                result
+            })
+            .expect("failed to spawn diarization worker");
+
+        let (startup_tx, startup_rx) = std::sync::mpsc::channel();
+        let (transcription_done_tx, transcription_done_rx) = std::sync::mpsc::channel();
         let worker_cancelled = std::sync::Arc::clone(&cancelled);
+        tokio::task::spawn_blocking(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_transcription_worker(TranscriptionWorkerParams {
+                    max_sources: self.max_sources,
+                    model: self.model,
+                    primary_vad: self.vad,
+                    vad_factory: self.vad_factory,
+                    primary_options,
+                    diarization_tx,
+                    command_rx,
+                    event_tx,
+                    cancelled: worker_cancelled,
+                    startup_reply: startup_tx,
+                });
+            }));
+            let _ = transcription_done_tx.send(result);
+        });
         let worker = tokio::task::spawn_blocking(move || {
-            run_transcription_worker(
-                self.max_sources,
-                self.model,
-                self.vad,
-                self.vad_factory,
-                command_rx,
-                event_tx,
-                worker_cancelled,
-            );
+            let transcription_result = transcription_done_rx
+                .recv()
+                .expect("transcription worker completion channel closed");
+            let diarization_result = match diarization_worker.join() {
+                Ok(result) => result,
+                Err(payload) => Err(payload),
+            };
+            if let Err(payload) = transcription_result {
+                std::panic::resume_unwind(payload);
+            }
+            if let Err(payload) = diarization_result {
+                std::panic::resume_unwind(payload);
+            }
         });
 
-        TranscriptionSession {
+        if wait_for_diarizer {
+            startup_rx.recv().map_err(|_| Error::StreamClosed)??;
+        }
+
+        Ok(TranscriptionSession {
             input: AudioInput::new(AudioSourceId::PRIMARY, command_tx, cancelled),
             events,
             worker,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -134,6 +207,7 @@ impl Transcriber {
             max_sources: config.max_sources,
             model,
             vad,
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         })
     }
 }
@@ -151,6 +225,12 @@ impl VadFactory for UnavailableVadFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diarization::fake::{
+        Behavior as FakeDiarizerBehavior, factory as fake_diarizer_factory,
+        factory_with_capacity as fake_diarizer_factory_with_capacity,
+        failing_factory as failing_diarizer_factory,
+    };
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -229,6 +309,523 @@ mod tests {
 
     fn test_config() -> TranscriberConfig {
         TranscriberConfig::new("model-dir")
+    }
+
+    #[tokio::test]
+    async fn all_off_sources_do_not_initialize_diarization() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (diarizer_factory, creates, opened, pushes) =
+            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeEach {
+                speakers: vec![diarization::BackendSpeakerId::new(1)],
+            });
+        let transcriber = Transcriber {
+            input_capacity: 4,
+            max_sources: 2,
+            model: Box::new(FakeModel {
+                calls: Arc::clone(&calls),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }]],
+            }),
+            vad_factory: Box::new(FakeVadFactory {
+                vads: vec![Box::new(FakeVad {
+                    chunks: vec![vec![vad::SpeechChunk {
+                        samples: vec![0.2; 6],
+                        start_sample: 0,
+                        end_sample: 6,
+                    }]],
+                })],
+            }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+
+        let mut session = transcriber.start();
+        let additional = session.open_source().await.unwrap();
+        session.input.send(vec![0.1; 4]).await.unwrap();
+        additional.send(vec![0.2; 6]).await.unwrap();
+        additional.close().await.unwrap();
+        session.input.close().await.unwrap();
+
+        let mut speakers = Vec::new();
+        while let Some(event) = session.events.recv().await {
+            match event.unwrap() {
+                TranscriptEvent::Segment(segment) => speakers.push(segment.speaker_id),
+                TranscriptEvent::EndOfStream => break,
+            }
+        }
+        session.worker.await.unwrap();
+
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        assert!(opened.lock().unwrap().is_empty());
+        assert!(pushes.lock().unwrap().is_empty());
+        assert_eq!(*calls.lock().unwrap(), vec![4, 6]);
+        assert_eq!(speakers, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn mixed_sources_route_only_enabled_pcm_through_diarization() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (diarizer_factory, creates, opened, pushes) =
+            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeEach {
+                speakers: vec![diarization::BackendSpeakerId::new(7)],
+            });
+        let transcriber = Transcriber {
+            input_capacity: 4,
+            max_sources: 2,
+            model: Box::new(FakeModel {
+                calls: Arc::clone(&calls),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }]],
+            }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+
+        let mut session = transcriber.start();
+        let additional = session
+            .open_source_with_options(AudioSourceOptions::ON)
+            .await
+            .unwrap();
+        let additional_id = additional.source_id();
+        session.input.send(vec![0.1; 4]).await.unwrap();
+        additional.send(vec![0.2; 8]).await.unwrap();
+        additional.close().await.unwrap();
+        session.input.close().await.unwrap();
+
+        let mut segments = Vec::new();
+        while let Some(event) = session.events.recv().await {
+            match event.unwrap() {
+                TranscriptEvent::Segment(segment) => segments.push(segment),
+                TranscriptEvent::EndOfStream => break,
+            }
+        }
+        session.worker.await.unwrap();
+
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(*opened.lock().unwrap(), vec![additional_id]);
+        assert_eq!(*pushes.lock().unwrap(), vec![(additional_id, vec![0.2; 8])]);
+        assert_eq!(*calls.lock().unwrap(), vec![4, 8]);
+        assert_eq!(segments.len(), 2);
+        let primary = segments
+            .iter()
+            .find(|segment| segment.source_id == AudioSourceId::PRIMARY)
+            .unwrap();
+        let diarized = segments
+            .iter()
+            .find(|segment| segment.source_id == additional_id)
+            .unwrap();
+        assert_eq!(primary.speaker_id, None);
+        assert_eq!(diarized.speaker_id, Some(SpeakerId::new(0)));
+    }
+
+    #[tokio::test]
+    async fn enabled_sources_share_one_worker_and_use_session_unique_speaker_ids() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (diarizer_factory, creates, opened, _) =
+            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeEach {
+                speakers: vec![diarization::BackendSpeakerId::new(3)],
+            });
+        let transcriber = Transcriber {
+            input_capacity: 4,
+            max_sources: 2,
+            model: Box::new(FakeModel {
+                calls: Arc::clone(&calls),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+
+        let mut session = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap();
+        let additional = session
+            .open_source_with_options(AudioSourceOptions::ON)
+            .await
+            .unwrap();
+        let additional_id = additional.source_id();
+        session.input.send(vec![0.1; 4]).await.unwrap();
+        additional.send(vec![0.2; 4]).await.unwrap();
+        additional.close().await.unwrap();
+        session.input.close().await.unwrap();
+
+        let mut speaker_ids = Vec::new();
+        while let Some(event) = session.events.recv().await {
+            match event.unwrap() {
+                TranscriptEvent::Segment(segment) => speaker_ids.push(segment.speaker_id.unwrap()),
+                TranscriptEvent::EndOfStream => break,
+            }
+        }
+        session.worker.await.unwrap();
+
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![AudioSourceId::PRIMARY, additional_id]
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![4, 4]);
+        speaker_ids.sort_by_key(|id| id.get());
+        assert_eq!(speaker_ids, vec![SpeakerId::new(0), SpeakerId::new(1)]);
+    }
+
+    #[tokio::test]
+    async fn overlapping_speech_creates_one_unattributed_asr_job() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (diarizer_factory, _, _, _) =
+            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeEach {
+                speakers: vec![
+                    diarization::BackendSpeakerId::new(1),
+                    diarization::BackendSpeakerId::new(2),
+                ],
+            });
+        let transcriber = Transcriber {
+            input_capacity: 2,
+            max_sources: 1,
+            model: Box::new(FakeModel {
+                calls: Arc::clone(&calls),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+
+        let mut session = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap();
+        session.input.send(vec![0.4; 5]).await.unwrap();
+        session.input.close().await.unwrap();
+        let segment = session.events.recv().await.unwrap().unwrap();
+        let TranscriptEvent::Segment(segment) = segment else {
+            panic!("expected one segment")
+        };
+        assert_eq!(segment.speaker_id, None);
+        assert_eq!(*calls.lock().unwrap(), vec![5]);
+        assert!(matches!(
+            session.events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+        session.worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diarizer_initialization_failure_rejects_only_enabled_source() {
+        let (diarizer_factory, creates) =
+            failing_diarizer_factory(Error::Backend("fake initialization failure".to_string()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transcriber = Transcriber {
+            input_capacity: 2,
+            max_sources: 2,
+            model: Box::new(FakeModel {
+                calls: Arc::clone(&calls),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad {
+                chunks: vec![vec![vad::SpeechChunk {
+                    samples: vec![0.1; 4],
+                    start_sample: 0,
+                    end_sample: 4,
+                }]],
+            }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+
+        let mut session = transcriber.start();
+        assert_eq!(
+            session
+                .open_source_with_options(AudioSourceOptions::ON)
+                .await
+                .unwrap_err(),
+            Error::Backend("fake initialization failure".to_string())
+        );
+        session.input.send(vec![0.1; 4]).await.unwrap();
+        session.input.close().await.unwrap();
+        assert!(matches!(
+            session.events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::Segment(_)
+        ));
+        assert!(matches!(
+            session.events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+        session.worker.await.unwrap();
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(*calls.lock().unwrap(), vec![4]);
+    }
+
+    #[tokio::test]
+    async fn diarizer_runtime_failure_is_one_terminal_session_error() {
+        let (diarizer_factory, _, _, _) = fake_diarizer_factory(FakeDiarizerBehavior::FailPush(
+            Error::Backend("fake diarization runtime failure".to_string()),
+        ));
+        let transcriber = Transcriber {
+            input_capacity: 2,
+            max_sources: 1,
+            model: Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+
+        let (input, mut events, worker) = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap()
+            .into_parts();
+        input.send(vec![0.1; 4]).await.unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().unwrap_err(),
+            Error::Backend("fake diarization runtime failure".to_string())
+        );
+        assert_eq!(events.recv().await, None);
+        worker.await.unwrap();
+        assert_eq!(input.close().await.unwrap_err(), Error::StreamClosed);
+    }
+
+    #[tokio::test]
+    async fn enabled_source_close_flushes_final_job_before_reply() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (diarizer_factory, _, _, _) = fake_diarizer_factory(FakeDiarizerBehavior::Flush {
+            speakers: vec![diarization::BackendSpeakerId::new(9)],
+        });
+        let transcriber = Transcriber {
+            input_capacity: 2,
+            max_sources: 1,
+            model: Box::new(FakeModel {
+                calls: Arc::clone(&calls),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+
+        let mut session = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap();
+        session
+            .input
+            .send_at(Duration::from_millis(100), vec![0.1; 4])
+            .await
+            .unwrap();
+        session.input.close().await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![4]);
+
+        let TranscriptEvent::Segment(segment) = session.events.recv().await.unwrap().unwrap()
+        else {
+            panic!("expected flushed segment")
+        };
+        assert_eq!(segment.speaker_id, Some(SpeakerId::new(0)));
+        assert_eq!(segment.start, Duration::from_millis(100));
+        assert_eq!(
+            segment.end,
+            Duration::from_millis(100) + Duration::from_micros(250)
+        );
+        assert!(matches!(
+            session.events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+        session.worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_pcm_releases_input_capacity_when_worker_consumes_it() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let (diarizer_factory, _, _, _) =
+            fake_diarizer_factory(FakeDiarizerBehavior::BlockThenFinalize {
+                speakers: vec![diarization::BackendSpeakerId::new(1)],
+                started: started_tx,
+                release: release_rx,
+            });
+        let transcriber = Transcriber {
+            input_capacity: 1,
+            max_sources: 1,
+            model: Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+        let (input, mut events, worker) = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap()
+            .into_parts();
+
+        input.send(vec![0.1; 4]).await.unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        {
+            let second_send = input.send(vec![0.2; 4]);
+            tokio::pin!(second_send);
+            assert_eq!(
+                futures_util::FutureExt::now_or_never(second_send.as_mut()),
+                Some(Ok(()))
+            );
+        }
+        release_tx.send(()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx.send(()).unwrap();
+        input.close().await.unwrap();
+
+        let mut segment_count = 0;
+        while let Some(event) = events.recv().await {
+            match event.unwrap() {
+                TranscriptEvent::Segment(_) => segment_count += 1,
+                TranscriptEvent::EndOfStream => break,
+            }
+        }
+        worker.await.unwrap();
+        assert_eq!(segment_count, 2);
+    }
+
+    #[tokio::test]
+    async fn diarizer_lookahead_can_exceed_input_command_capacity() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (processed_tx, processed_rx) = std_mpsc::channel();
+        let (diarizer_factory, _, _, _) =
+            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeAfter {
+                pushes: 2,
+                speakers: vec![diarization::BackendSpeakerId::new(1)],
+                processed: processed_tx,
+            });
+        let transcriber = Transcriber {
+            input_capacity: 1,
+            max_sources: 1,
+            model: Box::new(FakeModel {
+                calls: Arc::clone(&calls),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+        let (input, mut events, worker) = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap()
+            .into_parts();
+
+        input.send(vec![0.1; 4]).await.unwrap();
+        processed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        {
+            let second_send = input.send(vec![0.2; 4]);
+            tokio::pin!(second_send);
+            assert_eq!(
+                futures_util::FutureExt::now_or_never(second_send.as_mut()),
+                Some(Ok(())),
+                "lookahead input should not deadlock behind retained PCM"
+            );
+        }
+        input.close().await.unwrap();
+
+        let TranscriptEvent::Segment(segment) = events.recv().await.unwrap().unwrap() else {
+            panic!("expected one diarized segment")
+        };
+        assert_eq!(segment.speaker_id, Some(SpeakerId::new(0)));
+        assert_eq!(*calls.lock().unwrap(), vec![8]);
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::EndOfStream
+        ));
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diarizer_retained_pcm_is_bounded_separately_from_input_commands() {
+        let (diarizer_factory, _, _, _) = fake_diarizer_factory_with_capacity(
+            FakeDiarizerBehavior::Flush {
+                speakers: vec![diarization::BackendSpeakerId::new(1)],
+            },
+            4,
+        );
+        let transcriber = Transcriber {
+            input_capacity: 1,
+            max_sources: 1,
+            model: Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+        let (input, mut events, worker) = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap()
+            .into_parts();
+
+        input.send(vec![0.1; 5]).await.unwrap();
+        assert_eq!(
+            events.recv().await.unwrap().unwrap_err(),
+            Error::Backend(
+                "invalid diarization output: backend retained 5 PCM samples, exceeding its declared limit of 4"
+                    .to_string()
+            )
+        );
+        assert_eq!(events.recv().await, None);
+        worker.await.unwrap();
+        assert_eq!(input.close().await.unwrap_err(), Error::StreamClosed);
+    }
+
+    #[tokio::test]
+    async fn enabled_source_reports_timestamp_discontinuity_as_terminal() {
+        let (diarizer_factory, _, _, _) =
+            fake_diarizer_factory(FakeDiarizerBehavior::FinalizeEach {
+                speakers: vec![diarization::BackendSpeakerId::new(1)],
+            });
+        let transcriber = Transcriber {
+            input_capacity: 2,
+            max_sources: 1,
+            model: Box::new(FakeModel {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                next: 0,
+            }),
+            vad: Box::new(FakeVad { chunks: Vec::new() }),
+            vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(diarizer_factory),
+        };
+        let (input, mut events, worker) = transcriber
+            .start_with_options(AudioSourceOptions::ON)
+            .unwrap()
+            .into_parts();
+
+        input
+            .send_at(Duration::from_millis(10), vec![0.1; 4])
+            .await
+            .unwrap();
+        input
+            .send_at(Duration::from_millis(20), vec![0.2; 4])
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap(),
+            TranscriptEvent::Segment(_)
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap().unwrap_err(),
+            Error::TimestampDiscontinuity {
+                source_id: AudioSourceId::PRIMARY,
+                ..
+            }
+        ));
+        assert_eq!(events.recv().await, None);
+        worker.await.unwrap();
     }
 
     #[tokio::test]
@@ -407,6 +1004,7 @@ mod tests {
             model: Box::new(model),
             vad: Box::new(primary_vad),
             vad_factory: Box::new(vad_factory),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         };
 
         let mut session = transcriber.start();
@@ -582,6 +1180,7 @@ mod tests {
             vad_factory: Box::new(FakeVadFactory {
                 vads: vec![Box::new(system_source_vad)],
             }),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         };
 
         let mut session = transcriber.start();
@@ -623,6 +1222,7 @@ mod tests {
                     Box::new(FakeVad { chunks: Vec::new() }),
                 ],
             }),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         };
 
         let mut session = transcriber.start();
@@ -668,6 +1268,7 @@ mod tests {
                 ],
             }),
             vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         };
         let (input, mut events, worker) = transcriber.start().into_parts();
         let monitor = events.monitor();
@@ -787,6 +1388,7 @@ mod tests {
                 }]],
             }),
             vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         };
         let (input, events, worker) = transcriber.start().into_parts();
         let monitor = events.monitor();
@@ -842,6 +1444,7 @@ mod tests {
                     Box::new(FakeVad { chunks: Vec::new() }),
                 ],
             }),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         };
         let mut session = transcriber.start();
         let additional = session.open_source().await.unwrap();
@@ -901,6 +1504,7 @@ mod tests {
                 }]],
             }),
             vad_factory: Box::new(FakeVadFactory { vads: Vec::new() }),
+            diarizer_factory: Box::new(UnavailableDiarizerFactory),
         };
         let session = transcriber.start();
         let input = session.input;

@@ -1,10 +1,16 @@
 use crate::PCM_SAMPLE_RATE_HZ;
 use crate::backend::AsrModel;
-use crate::event::{SegmentId, TranscriptEvent, TranscriptSegment};
+use crate::diarization::{
+    AudioSourceOptions, BackendSpeakerId, DiarizationMode, DiarizationOutput, Diarizer,
+    DiarizerFactory,
+};
+use crate::event::{SegmentId, SpeakerId, TranscriptEvent, TranscriptSegment};
 use crate::vad::{SpeechChunk, VadFactory, VadGate, duration_from_samples};
 use crate::{AudioSourceId, Error, Result};
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -12,7 +18,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-/// Join handle for the blocking transcription worker.
+/// Join handle that completes after both session workers have stopped.
 pub type TranscriptionWorker = JoinHandle<()>;
 
 /// A point-in-time snapshot of transcript output delivery statistics.
@@ -351,6 +357,10 @@ impl CommandSender {
     pub(crate) fn downgrade(&self) -> mpsc::WeakUnboundedSender<SessionCommand> {
         self.inner.downgrade()
     }
+
+    pub(crate) fn internal_sender(&self) -> mpsc::UnboundedSender<SessionCommand> {
+        self.inner.clone()
+    }
 }
 
 /// Input handle for one registered audio source.
@@ -522,11 +532,19 @@ impl TranscriptionSession {
     /// This waits for the source's VAD session to initialize. Closing a source
     /// releases its state and makes its capacity available to another source.
     pub async fn open_source(&self) -> Result<AudioInput> {
+        self.open_source_with_options(AudioSourceOptions::OFF).await
+    }
+
+    pub(crate) async fn open_source_with_options(
+        &self,
+        options: AudioSourceOptions,
+    ) -> Result<AudioInput> {
         self.input.ensure_active()?;
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.input
-            .commands
-            .send(SessionCommand::OpenSource { reply: reply_tx })?;
+        self.input.commands.send(SessionCommand::OpenSource {
+            options,
+            reply: reply_tx,
+        })?;
         let result = reply_rx.await.map_err(|_| Error::StreamClosed)?;
         self.input.ensure_active()?;
         let source_id = result?;
@@ -546,6 +564,7 @@ impl TranscriptionSession {
 pub(crate) enum SessionCommand {
     Cancel,
     OpenSource {
+        options: AudioSourceOptions,
         reply: oneshot::Sender<Result<AudioSourceId>>,
     },
     Audio {
@@ -558,6 +577,41 @@ pub(crate) enum SessionCommand {
         source_id: AudioSourceId,
         reply: Option<oneshot::Sender<Result<()>>>,
     },
+    DiarizedJob {
+        job: TranscriptionJob,
+        capacity_permit: OwnedSemaphorePermit,
+    },
+    DiarizedSourceClosed {
+        source_id: AudioSourceId,
+        result: Result<()>,
+    },
+    DiarizationFailed(Error),
+}
+
+pub(crate) enum DiarizationCommand {
+    OpenSource {
+        source_id: AudioSourceId,
+        reply: std_mpsc::Sender<Result<()>>,
+    },
+    Audio {
+        source_id: AudioSourceId,
+        timestamp: Option<Duration>,
+        samples: Vec<f32>,
+        capacity_permit: OwnedSemaphorePermit,
+    },
+    CloseSource {
+        source_id: AudioSourceId,
+    },
+    Cancel,
+}
+
+#[derive(Debug)]
+pub(crate) struct TranscriptionJob {
+    source_id: AudioSourceId,
+    speaker_id: Option<SpeakerId>,
+    start_sample: u64,
+    end_sample: u64,
+    samples: Vec<f32>,
 }
 
 pub(crate) struct EventSender {
@@ -602,25 +656,53 @@ pub(crate) fn output_channel(
     )
 }
 
-pub(crate) fn run_transcription_worker(
-    max_sources: usize,
-    mut model: Box<dyn AsrModel>,
-    primary_vad: Box<dyn VadGate>,
-    mut vad_factory: Box<dyn VadFactory>,
-    mut command_rx: mpsc::UnboundedReceiver<SessionCommand>,
-    event_tx: EventSender,
-    cancelled: Arc<AtomicBool>,
-) {
+pub(crate) struct TranscriptionWorkerParams {
+    pub(crate) max_sources: usize,
+    pub(crate) model: Box<dyn AsrModel>,
+    pub(crate) primary_vad: Box<dyn VadGate>,
+    pub(crate) vad_factory: Box<dyn VadFactory>,
+    pub(crate) primary_options: AudioSourceOptions,
+    pub(crate) diarization_tx: mpsc::UnboundedSender<DiarizationCommand>,
+    pub(crate) command_rx: mpsc::UnboundedReceiver<SessionCommand>,
+    pub(crate) event_tx: EventSender,
+    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) startup_reply: std_mpsc::Sender<Result<()>>,
+}
+
+pub(crate) fn run_transcription_worker(params: TranscriptionWorkerParams) {
+    let TranscriptionWorkerParams {
+        max_sources,
+        mut model,
+        primary_vad,
+        mut vad_factory,
+        primary_options,
+        diarization_tx,
+        mut command_rx,
+        event_tx,
+        cancelled,
+        startup_reply,
+    } = params;
+    let _diarization_shutdown = DiarizationShutdown(diarization_tx.clone());
     let mut next_segment_id = 0u64;
     let mut next_source_id = 1u64;
-    let mut sources = vec![(
-        AudioSourceId::PRIMARY,
-        SourceState {
-            vad: primary_vad,
-            next_input_sample: 0,
-            timeline_offset_sample: None,
-        },
-    )];
+    let primary_state = match primary_options.diarization {
+        DiarizationMode::Off => Ok(SourceState::Direct(DirectSourceState::new(primary_vad))),
+        DiarizationMode::On => open_diarization_source(&diarization_tx, AudioSourceId::PRIMARY)
+            .map(|()| SourceState::Diarized {
+                closing: false,
+                close_reply: None,
+            }),
+    };
+    let mut sources = match primary_state {
+        Ok(state) => {
+            let _ = startup_reply.send(Ok(()));
+            vec![(AudioSourceId::PRIMARY, state)]
+        }
+        Err(err) => {
+            let _ = startup_reply.send(Err(err));
+            return;
+        }
+    };
 
     loop {
         if cancelled.load(Ordering::Acquire) {
@@ -637,22 +719,12 @@ pub(crate) fn run_transcription_worker(
         }
         match command {
             SessionCommand::Cancel => return,
-            SessionCommand::OpenSource { reply } => {
+            SessionCommand::OpenSource { options, reply } => {
                 if sources.len() >= max_sources {
                     let _ = reply.send(Err(Error::SourceLimit { max_sources }));
                     continue;
                 }
 
-                let vad = match vad_factory.create() {
-                    Ok(vad) => vad,
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                };
-                if cancelled.load(Ordering::Acquire) {
-                    return;
-                }
                 let source_id = AudioSourceId::new(next_source_id);
                 next_source_id = match next_source_id.checked_add(1) {
                     Some(value) => value,
@@ -663,17 +735,43 @@ pub(crate) fn run_transcription_worker(
                         continue;
                     }
                 };
+
+                let source =
+                    match options.diarization {
+                        DiarizationMode::Off => vad_factory
+                            .create()
+                            .map(|vad| SourceState::Direct(DirectSourceState::new(vad))),
+                        DiarizationMode::On => open_diarization_source(&diarization_tx, source_id)
+                            .map(|()| SourceState::Diarized {
+                                closing: false,
+                                close_reply: None,
+                            }),
+                    };
+                let mut source = match source {
+                    Ok(source) => source,
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
+                };
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 if reply.send(Ok(source_id)).is_err() {
+                    if let SourceState::Diarized { closing, .. } = &mut source {
+                        *closing = true;
+                        sources.push((source_id, source));
+                        if diarization_tx
+                            .send(DiarizationCommand::CloseSource { source_id })
+                            .is_err()
+                        {
+                            fail(&event_tx, Error::StreamClosed);
+                            return;
+                        }
+                    }
                     continue;
                 }
-                sources.push((
-                    source_id,
-                    SourceState {
-                        vad,
-                        next_input_sample: 0,
-                        timeline_offset_sample: None,
-                    },
-                ));
+                sources.push((source_id, source));
             }
             SessionCommand::Audio {
                 source_id,
@@ -681,7 +779,6 @@ pub(crate) fn run_transcription_worker(
                 samples,
                 capacity_permit,
             } => {
-                drop(capacity_permit);
                 let Some(source) = sources
                     .iter_mut()
                     .find(|(id, _)| *id == source_id)
@@ -690,19 +787,38 @@ pub(crate) fn run_transcription_worker(
                     fail(&event_tx, Error::SourceNotFound { source_id });
                     return;
                 };
-                let mut sink = EventSink {
-                    event_tx: &event_tx,
-                    next_segment_id: &mut next_segment_id,
-                    cancelled: cancelled.as_ref(),
+                let result = match source {
+                    SourceState::Direct(source) => {
+                        drop(capacity_permit);
+                        let mut sink = EventSink {
+                            event_tx: &event_tx,
+                            next_segment_id: &mut next_segment_id,
+                            cancelled: cancelled.as_ref(),
+                        };
+                        process_chunk(
+                            model.as_mut(),
+                            source,
+                            &mut sink,
+                            source_id,
+                            timestamp,
+                            samples,
+                        )
+                    }
+                    SourceState::Diarized { closing, .. } => {
+                        if *closing {
+                            Err(Error::SourceNotFound { source_id })
+                        } else {
+                            diarization_tx
+                                .send(DiarizationCommand::Audio {
+                                    source_id,
+                                    timestamp,
+                                    samples,
+                                    capacity_permit,
+                                })
+                                .map_err(|_| Error::StreamClosed)
+                        }
+                    }
                 };
-                let result = process_chunk(
-                    model.as_mut(),
-                    source,
-                    &mut sink,
-                    source_id,
-                    timestamp,
-                    samples,
-                );
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
@@ -718,18 +834,96 @@ pub(crate) fn run_transcription_worker(
                     }
                     continue;
                 };
-                let (_, source) = sources.remove(position);
-
+                match &mut sources[position].1 {
+                    SourceState::Direct(_) => {
+                        let (_, SourceState::Direct(source)) = sources.remove(position) else {
+                            unreachable!("source variant changed while closing")
+                        };
+                        let mut sink = EventSink {
+                            event_tx: &event_tx,
+                            next_segment_id: &mut next_segment_id,
+                            cancelled: cancelled.as_ref(),
+                        };
+                        let result = finish_source(model.as_mut(), source, &mut sink, source_id);
+                        if cancelled.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if let Some(reply) = reply {
+                            let _ = reply.send(result.clone());
+                        }
+                        if let Err(err) = result {
+                            fail(&event_tx, err);
+                            return;
+                        }
+                        if sources.is_empty() {
+                            let _ = event_tx.send(Ok(TranscriptEvent::EndOfStream));
+                            return;
+                        }
+                    }
+                    SourceState::Diarized {
+                        closing,
+                        close_reply,
+                    } => {
+                        if *closing {
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(Error::SourceNotFound { source_id }));
+                            }
+                            continue;
+                        }
+                        *closing = true;
+                        *close_reply = reply;
+                        if diarization_tx
+                            .send(DiarizationCommand::CloseSource { source_id })
+                            .is_err()
+                        {
+                            fail(&event_tx, Error::StreamClosed);
+                            return;
+                        }
+                    }
+                }
+            }
+            SessionCommand::DiarizedJob {
+                job,
+                capacity_permit,
+            } => {
+                let active = sources.iter().any(|(source_id, source)| {
+                    *source_id == job.source_id && matches!(source, SourceState::Diarized { .. })
+                });
+                if !active {
+                    fail(
+                        &event_tx,
+                        Error::SourceNotFound {
+                            source_id: job.source_id,
+                        },
+                    );
+                    return;
+                }
                 let mut sink = EventSink {
                     event_tx: &event_tx,
                     next_segment_id: &mut next_segment_id,
                     cancelled: cancelled.as_ref(),
                 };
-                let result = finish_source(model.as_mut(), source, &mut sink, source_id);
+                let result = handle_transcription_job(model.as_mut(), &mut sink, job);
+                drop(capacity_permit);
                 if cancelled.load(Ordering::Acquire) {
                     return;
                 }
-                if let Some(reply) = reply {
+                if let Err(err) = result {
+                    fail(&event_tx, err);
+                    return;
+                }
+            }
+            SessionCommand::DiarizedSourceClosed { source_id, result } => {
+                let Some(position) = sources.iter().position(|(id, _)| *id == source_id) else {
+                    fail(&event_tx, Error::SourceNotFound { source_id });
+                    return;
+                };
+                let (_, source) = sources.remove(position);
+                let SourceState::Diarized { close_reply, .. } = source else {
+                    fail(&event_tx, Error::SourceNotFound { source_id });
+                    return;
+                };
+                if let Some(reply) = close_reply {
                     let _ = reply.send(result.clone());
                 }
                 if let Err(err) = result {
@@ -741,6 +935,10 @@ pub(crate) fn run_transcription_worker(
                     return;
                 }
             }
+            SessionCommand::DiarizationFailed(err) => {
+                fail(&event_tx, err);
+                return;
+            }
         }
     }
 
@@ -751,6 +949,9 @@ pub(crate) fn run_transcription_worker(
         if cancelled.load(Ordering::Acquire) {
             return;
         }
+        let SourceState::Direct(source) = source else {
+            return;
+        };
         let mut sink = EventSink {
             event_tx: &event_tx,
             next_segment_id: &mut next_segment_id,
@@ -764,8 +965,38 @@ pub(crate) fn run_transcription_worker(
     let _ = event_tx.send(Ok(TranscriptEvent::EndOfStream));
 }
 
-struct SourceState {
+struct DiarizationShutdown(mpsc::UnboundedSender<DiarizationCommand>);
+
+impl Drop for DiarizationShutdown {
+    fn drop(&mut self) {
+        let _ = self.0.send(DiarizationCommand::Cancel);
+    }
+}
+
+enum SourceState {
+    Direct(DirectSourceState),
+    Diarized {
+        closing: bool,
+        close_reply: Option<oneshot::Sender<Result<()>>>,
+    },
+}
+
+struct DirectSourceState {
     vad: Box<dyn VadGate>,
+    timeline: SourceTimeline,
+}
+
+impl DirectSourceState {
+    fn new(vad: Box<dyn VadGate>) -> Self {
+        Self {
+            vad,
+            timeline: SourceTimeline::default(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SourceTimeline {
     next_input_sample: u64,
     timeline_offset_sample: Option<u64>,
 }
@@ -778,17 +1009,18 @@ struct EventSink<'a> {
 
 fn resolve_timeline_offset(
     source_id: AudioSourceId,
-    source: &mut SourceState,
+    timeline: &mut SourceTimeline,
     timestamp: Option<Duration>,
 ) -> Result<u64> {
     let explicit_sample = timestamp
         .map(|timestamp| session_sample_from_duration(source_id, timestamp))
         .transpose()?;
 
-    match source.timeline_offset_sample {
+    match timeline.timeline_offset_sample {
         Some(offset) => {
             if let Some(actual_sample) = explicit_sample {
-                let expected_sample = timeline_sample(source_id, offset, source.next_input_sample)?;
+                let expected_sample =
+                    timeline_sample(source_id, offset, timeline.next_input_sample)?;
                 if actual_sample != expected_sample {
                     return Err(Error::TimestampDiscontinuity {
                         source_id,
@@ -801,7 +1033,7 @@ fn resolve_timeline_offset(
         }
         None => {
             let offset = explicit_sample.unwrap_or(0);
-            source.timeline_offset_sample = Some(offset);
+            timeline.timeline_offset_sample = Some(offset);
             Ok(offset)
         }
     }
@@ -829,15 +1061,17 @@ fn timeline_sample(source_id: AudioSourceId, offset: u64, sample: u64) -> Result
 
 fn process_chunk(
     model: &mut dyn AsrModel,
-    source: &mut SourceState,
+    source: &mut DirectSourceState,
     sink: &mut EventSink<'_>,
     source_id: AudioSourceId,
     timestamp: Option<Duration>,
     samples: Vec<f32>,
 ) -> Result<()> {
-    let timeline_offset_sample = resolve_timeline_offset(source_id, source, timestamp)?;
-    let start_sample = source.next_input_sample;
-    source.next_input_sample = source
+    let timeline_offset_sample =
+        resolve_timeline_offset(source_id, &mut source.timeline, timestamp)?;
+    let start_sample = source.timeline.next_input_sample;
+    source.timeline.next_input_sample = source
+        .timeline
         .next_input_sample
         .saturating_add(samples.len() as u64);
     let speech_chunks = source.vad.push(&samples, start_sample)?;
@@ -852,7 +1086,7 @@ fn process_chunk(
 
 fn finish_source(
     model: &mut dyn AsrModel,
-    mut source: SourceState,
+    mut source: DirectSourceState,
     sink: &mut EventSink<'_>,
     source_id: AudioSourceId,
 ) -> Result<()> {
@@ -863,7 +1097,7 @@ fn finish_source(
     if sink.cancelled.load(Ordering::Acquire) {
         return Ok(());
     }
-    let timeline_offset_sample = source.timeline_offset_sample.unwrap_or(0);
+    let timeline_offset_sample = source.timeline.timeline_offset_sample.unwrap_or(0);
     handle_speech_chunks(model, sink, source_id, timeline_offset_sample, final_chunks)
 }
 
@@ -881,51 +1115,443 @@ fn handle_speech_chunks(
         if speech.samples.is_empty() {
             continue;
         }
-        let started = Instant::now();
-        let text = model.transcribe(speech.samples)?;
-        if sink.cancelled.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        if text.trim().is_empty() {
-            continue;
-        }
-        send_transcript(
-            sink,
+        let job = TranscriptionJob {
             source_id,
-            timeline_offset_sample,
-            speech.start_sample,
-            speech.end_sample,
-            text,
-            started.elapsed(),
-        )?;
+            speaker_id: None,
+            start_sample: timeline_sample(source_id, timeline_offset_sample, speech.start_sample)?,
+            end_sample: timeline_sample(source_id, timeline_offset_sample, speech.end_sample)?,
+            samples: speech.samples,
+        };
+        handle_transcription_job(model, sink, job)?;
     }
     Ok(())
 }
 
+fn handle_transcription_job(
+    model: &mut dyn AsrModel,
+    sink: &mut EventSink<'_>,
+    mut job: TranscriptionJob,
+) -> Result<()> {
+    if job.samples.is_empty() || sink.cancelled.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let text = model.transcribe(std::mem::take(&mut job.samples))?;
+    if sink.cancelled.load(Ordering::Acquire) || text.trim().is_empty() {
+        return Ok(());
+    }
+    send_transcript(sink, job, text, started.elapsed())
+}
+
 fn send_transcript(
     sink: &mut EventSink<'_>,
-    source_id: AudioSourceId,
-    timeline_offset_sample: u64,
-    transcript_start_sample: u64,
-    transcript_end_sample: u64,
+    job: TranscriptionJob,
     text: String,
     inference_duration: Duration,
 ) -> Result<()> {
     let id = SegmentId::new(*sink.next_segment_id);
     *sink.next_segment_id = sink.next_segment_id.saturating_add(1);
-    let start_sample = timeline_sample(source_id, timeline_offset_sample, transcript_start_sample)?;
-    let end_sample = timeline_sample(source_id, timeline_offset_sample, transcript_end_sample)?;
     sink.event_tx
         .send(Ok(TranscriptEvent::Segment(TranscriptSegment {
             id,
-            source_id,
-            speaker_id: None,
+            source_id: job.source_id,
+            speaker_id: job.speaker_id,
             text,
-            start: duration_from_samples(start_sample),
-            end: duration_from_samples(end_sample),
+            start: duration_from_samples(job.start_sample),
+            end: duration_from_samples(job.end_sample),
             inference_duration,
             is_final: true,
         })))
+}
+
+fn open_diarization_source(
+    diarization_tx: &mpsc::UnboundedSender<DiarizationCommand>,
+    source_id: AudioSourceId,
+) -> Result<()> {
+    let (reply_tx, reply_rx) = std_mpsc::channel();
+    diarization_tx
+        .send(DiarizationCommand::OpenSource {
+            source_id,
+            reply: reply_tx,
+        })
+        .map_err(|_| Error::StreamClosed)?;
+    reply_rx.recv().map_err(|_| Error::StreamClosed)?
+}
+
+pub(crate) fn run_diarization_worker(
+    factory: Box<dyn DiarizerFactory>,
+    mut command_rx: mpsc::UnboundedReceiver<DiarizationCommand>,
+    session_tx: mpsc::UnboundedSender<SessionCommand>,
+    job_capacity: Arc<Semaphore>,
+    runtime: Handle,
+) {
+    let mut state = DiarizationWorkerState {
+        factory,
+        diarizer: None,
+        sources: HashMap::new(),
+        speaker_ids: HashMap::new(),
+        next_speaker_id: 0,
+        session_tx,
+        job_capacity,
+        runtime,
+    };
+
+    while let Some(command) = command_rx.blocking_recv() {
+        match command {
+            DiarizationCommand::Cancel => return,
+            DiarizationCommand::OpenSource { source_id, reply } => {
+                let _ = reply.send(state.open_source(source_id));
+            }
+            DiarizationCommand::Audio {
+                source_id,
+                timestamp,
+                samples,
+                capacity_permit,
+            } => {
+                // This permit bounds commands waiting to be consumed, not PCM
+                // retained for backend lookahead. Keeping it past this point
+                // can prevent the very input needed to advance the watermark.
+                drop(capacity_permit);
+                let result = state.process_audio(source_id, timestamp, samples);
+                if let Err(err) = result {
+                    let _ = state
+                        .session_tx
+                        .send(SessionCommand::DiarizationFailed(err));
+                    return;
+                }
+            }
+            DiarizationCommand::CloseSource { source_id } => {
+                let result = state.finish_source(source_id);
+                let failed = result.is_err();
+                if state
+                    .session_tx
+                    .send(SessionCommand::DiarizedSourceClosed { source_id, result })
+                    .is_err()
+                {
+                    return;
+                }
+                if failed {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+struct DiarizationWorkerState {
+    factory: Box<dyn DiarizerFactory>,
+    diarizer: Option<Box<dyn Diarizer>>,
+    sources: HashMap<AudioSourceId, DiarizationSourceState>,
+    speaker_ids: HashMap<(AudioSourceId, BackendSpeakerId), SpeakerId>,
+    next_speaker_id: u64,
+    session_tx: mpsc::UnboundedSender<SessionCommand>,
+    job_capacity: Arc<Semaphore>,
+    runtime: Handle,
+}
+
+impl DiarizationWorkerState {
+    fn open_source(&mut self, source_id: AudioSourceId) -> Result<()> {
+        if self.sources.contains_key(&source_id) {
+            return Err(Error::InvalidConfig(format!(
+                "diarization source {} is already active",
+                source_id.get()
+            )));
+        }
+        if self.diarizer.is_none() {
+            self.diarizer = Some(self.factory.create()?);
+        }
+        self.diarizer
+            .as_mut()
+            .expect("diarizer initialized above")
+            .open_source(source_id)?;
+        self.sources
+            .insert(source_id, DiarizationSourceState::default());
+        Ok(())
+    }
+
+    fn process_audio(
+        &mut self,
+        source_id: AudioSourceId,
+        timestamp: Option<Duration>,
+        samples: Vec<f32>,
+    ) -> Result<()> {
+        let source = self
+            .sources
+            .get_mut(&source_id)
+            .ok_or(Error::SourceNotFound { source_id })?;
+        let timeline_offset = resolve_timeline_offset(source_id, &mut source.timeline, timestamp)?;
+        let start_sample = source.timeline.next_input_sample;
+        source.timeline.next_input_sample = source
+            .timeline
+            .next_input_sample
+            .saturating_add(samples.len() as u64);
+        let output = self
+            .diarizer
+            .as_deref_mut()
+            .ok_or_else(|| Error::Backend("diarization model is not initialized".to_string()))?
+            .push(source_id, &samples, start_sample)?;
+        source.buffer.append(start_sample, samples)?;
+        self.process_output(source_id, timeline_offset, output)
+    }
+
+    fn finish_source(&mut self, source_id: AudioSourceId) -> Result<()> {
+        let source = self
+            .sources
+            .get(&source_id)
+            .ok_or(Error::SourceNotFound { source_id })?;
+        let timeline_offset = source.timeline.timeline_offset_sample.unwrap_or(0);
+        let output = self
+            .diarizer
+            .as_deref_mut()
+            .ok_or_else(|| Error::Backend("diarization model is not initialized".to_string()))?
+            .finish(source_id)?;
+        self.process_output(source_id, timeline_offset, output)?;
+
+        let source = self
+            .sources
+            .get(&source_id)
+            .expect("source remains active until its flush is validated");
+        if source.finalized_until != source.timeline.next_input_sample {
+            return Err(invalid_diarization_output(format!(
+                "flush for source {} finalized through sample {}, expected {}",
+                source_id.get(),
+                source.finalized_until,
+                source.timeline.next_input_sample
+            )));
+        }
+        self.sources.remove(&source_id);
+        self.speaker_ids
+            .retain(|(registered_source, _), _| *registered_source != source_id);
+        Ok(())
+    }
+
+    fn process_output(
+        &mut self,
+        source_id: AudioSourceId,
+        timeline_offset: u64,
+        output: DiarizationOutput,
+    ) -> Result<()> {
+        let max_retained_samples = self
+            .diarizer
+            .as_deref()
+            .ok_or_else(|| Error::Backend("diarization model is not initialized".to_string()))?
+            .max_retained_samples();
+        let retained_samples = self.sources.values().try_fold(0usize, |total, source| {
+            total.checked_add(source.buffer.len()).ok_or_else(|| {
+                invalid_diarization_output("retained PCM sample count overflowed".to_string())
+            })
+        })?;
+        let Self {
+            sources,
+            speaker_ids,
+            next_speaker_id,
+            session_tx,
+            job_capacity,
+            runtime,
+            ..
+        } = self;
+        let source = sources
+            .get_mut(&source_id)
+            .ok_or(Error::SourceNotFound { source_id })?;
+        if output.finalized_until < source.finalized_until
+            || output.finalized_until > source.timeline.next_input_sample
+        {
+            return Err(invalid_diarization_output(format!(
+                "source {} returned invalid watermark {} after {} with {} input samples",
+                source_id.get(),
+                output.finalized_until,
+                source.finalized_until,
+                source.timeline.next_input_sample
+            )));
+        }
+
+        let newly_finalized = usize::try_from(output.finalized_until - source.finalized_until)
+            .map_err(|_| {
+                invalid_diarization_output(
+                    "finalized PCM sample count does not fit in memory".to_string(),
+                )
+            })?;
+        let retained_after = retained_samples
+            .checked_sub(newly_finalized)
+            .ok_or_else(|| {
+                invalid_diarization_output(format!(
+                    "source {} finalized more PCM than the session retained",
+                    source_id.get()
+                ))
+            })?;
+        if retained_after > max_retained_samples {
+            return Err(invalid_diarization_output(format!(
+                "backend retained {retained_after} PCM samples, exceeding its declared limit of {max_retained_samples}"
+            )));
+        }
+
+        let mut previous_end = source.finalized_until;
+        for region in output.regions {
+            if region.start_sample < previous_end
+                || region.start_sample >= region.end_sample
+                || region.end_sample > output.finalized_until
+            {
+                return Err(invalid_diarization_output(format!(
+                    "source {} returned invalid finalized region {}..{}",
+                    source_id.get(),
+                    region.start_sample,
+                    region.end_sample
+                )));
+            }
+            previous_end = region.end_sample;
+            if region.speakers.is_empty() {
+                continue;
+            }
+
+            let samples = source
+                .buffer
+                .copy(region.start_sample, region.end_sample)
+                .ok_or_else(|| {
+                    invalid_diarization_output(format!(
+                        "source {} region {}..{} is outside retained PCM",
+                        source_id.get(),
+                        region.start_sample,
+                        region.end_sample
+                    ))
+                })?;
+            let speaker_id = if region.speakers.len() == 1 {
+                let key = (source_id, region.speakers[0]);
+                Some(match speaker_ids.get(&key) {
+                    Some(id) => *id,
+                    None => {
+                        let id = SpeakerId::new(*next_speaker_id);
+                        *next_speaker_id = next_speaker_id.checked_add(1).ok_or_else(|| {
+                            Error::InvalidConfig("speaker identifier space exhausted".to_string())
+                        })?;
+                        speaker_ids.insert(key, id);
+                        id
+                    }
+                })
+            } else {
+                None
+            };
+            let capacity_permit = runtime
+                .block_on(Arc::clone(job_capacity).acquire_owned())
+                .map_err(|_| Error::StreamClosed)?;
+            let job = TranscriptionJob {
+                source_id,
+                speaker_id,
+                start_sample: timeline_sample(source_id, timeline_offset, region.start_sample)?,
+                end_sample: timeline_sample(source_id, timeline_offset, region.end_sample)?,
+                samples,
+            };
+            session_tx
+                .send(SessionCommand::DiarizedJob {
+                    job,
+                    capacity_permit,
+                })
+                .map_err(|_| Error::StreamClosed)?;
+        }
+
+        source.buffer.discard_before(output.finalized_until);
+        source.finalized_until = output.finalized_until;
+        Ok(())
+    }
+}
+
+fn invalid_diarization_output(message: String) -> Error {
+    Error::Backend(format!("invalid diarization output: {message}"))
+}
+
+#[derive(Default)]
+struct DiarizationSourceState {
+    timeline: SourceTimeline,
+    finalized_until: u64,
+    buffer: RetainedPcm,
+}
+
+#[derive(Default)]
+struct RetainedPcm {
+    chunks: VecDeque<RetainedChunk>,
+    sample_count: usize,
+}
+
+struct RetainedChunk {
+    start_sample: u64,
+    samples: Vec<f32>,
+}
+
+impl RetainedPcm {
+    fn append(&mut self, start_sample: u64, samples: Vec<f32>) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let sample_count = self
+            .sample_count
+            .checked_add(samples.len())
+            .ok_or_else(|| {
+                invalid_diarization_output("retained PCM sample count overflowed".to_string())
+            })?;
+        if let Some(last) = self.chunks.back() {
+            let expected = last.start_sample.saturating_add(last.samples.len() as u64);
+            if start_sample != expected {
+                return Err(invalid_diarization_output(format!(
+                    "retained PCM starts at {start_sample}, expected {expected}"
+                )));
+            }
+        }
+        self.chunks.push_back(RetainedChunk {
+            start_sample,
+            samples,
+        });
+        self.sample_count = sample_count;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.sample_count
+    }
+
+    fn copy(&self, start_sample: u64, end_sample: u64) -> Option<Vec<f32>> {
+        let expected_len = usize::try_from(end_sample.checked_sub(start_sample)?).ok()?;
+        let mut samples = Vec::with_capacity(expected_len);
+        for chunk in &self.chunks {
+            let chunk_end = chunk
+                .start_sample
+                .saturating_add(chunk.samples.len() as u64);
+            let copy_start = start_sample.max(chunk.start_sample);
+            let copy_end = end_sample.min(chunk_end);
+            if copy_start >= copy_end {
+                continue;
+            }
+            let relative_start = usize::try_from(copy_start - chunk.start_sample).ok()?;
+            let relative_end = usize::try_from(copy_end - chunk.start_sample).ok()?;
+            samples.extend_from_slice(&chunk.samples[relative_start..relative_end]);
+        }
+        (samples.len() == expected_len).then_some(samples)
+    }
+
+    fn discard_before(&mut self, sample: u64) {
+        while self.chunks.front().is_some_and(|chunk| {
+            chunk
+                .start_sample
+                .saturating_add(chunk.samples.len() as u64)
+                <= sample
+        }) {
+            let removed = self
+                .chunks
+                .pop_front()
+                .expect("front chunk exists while discarding retained PCM");
+            self.sample_count = self.sample_count.saturating_sub(removed.samples.len());
+        }
+        let Some(chunk) = self.chunks.front_mut() else {
+            return;
+        };
+        if sample <= chunk.start_sample {
+            return;
+        }
+        let count = usize::try_from(sample - chunk.start_sample)
+            .unwrap_or(usize::MAX)
+            .min(chunk.samples.len());
+        chunk.samples.drain(..count);
+        chunk.start_sample = chunk.start_sample.saturating_add(count as u64);
+        self.sample_count = self.sample_count.saturating_sub(count);
+    }
 }
 
 fn fail(event_tx: &EventSender, err: Error) {
